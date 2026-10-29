@@ -27,7 +27,7 @@
 //   * "Liquidity" uses price-level proxies, not real resting orders.
 // =============================================================================
 
-indicator("NQ 5-Min ORB Breakout Probability Engine", shorttitle="ORB-PROB", overlay=true, max_lines_count=50, max_labels_count=100, max_boxes_count=20)
+indicator("NQ 5-Min ORB Breakout Probability Engine", shorttitle="ORB-PROB", overlay=true, max_lines_count=500, max_labels_count=100, max_boxes_count=20)
 
 // =============================================================================
 // SECTION 0 : INPUTS
@@ -595,11 +595,32 @@ stateStr = f_stateName(state)
 
 // =============================================================================
 // SECTION 10 : VISUALIZATION
+// -----------------------------------------------------------------------------
+// ORB high/low/mid are drawn with line.new (anchored to real bar/price
+// coordinates) rather than plot(...style_linebr), so the levels stay pinned to
+// the chart and extend cleanly across the session when panning/zooming. Each
+// new session starts fresh lines; the previous session's lines are left in
+// place as history.
 // =============================================================================
-plot(i_showORB and (orbReady or inORB) ? orbHigh : na, "ORB High", color=color.new(color.teal, 0), linewidth=2, style=plot.style_linebr)
-plot(i_showORB and (orbReady or inORB) ? orbLow  : na, "ORB Low",  color=color.new(color.maroon, 0), linewidth=2, style=plot.style_linebr)
-plot(i_showMid and orbReady ? orbMid : na, "ORB Mid", color=color.new(color.gray, 40), style=plot.style_linebr, linewidth=1)
-plot(i_showVWAP and inRTH ? vwapVal : na, "VWAP", color=color.new(color.blue, 0), linewidth=1)
+var line lnHigh = na
+var line lnMid  = na
+var line lnLow  = na
+
+// Start new ORB lines the moment the range completes (anchored at orbEndBar).
+if i_showORB and orbEnded
+    lnHigh := line.new(bar_index, orbHigh, bar_index, orbHigh, color=color.new(color.teal, 0), width=2)
+    lnLow  := line.new(bar_index, orbLow,  bar_index, orbLow,  color=color.new(color.maroon, 0), width=2)
+    if i_showMid
+        lnMid := line.new(bar_index, orbMid, bar_index, orbMid, color=color.new(color.gray, 40), width=1, style=line.style_dotted)
+
+// Extend the active ORB lines to the current bar through the RTH session.
+if i_showORB and orbReady and inRTH and not na(lnHigh)
+    line.set_x2(lnHigh, bar_index)
+    line.set_x2(lnLow,  bar_index)
+    if not na(lnMid)
+        line.set_x2(lnMid, bar_index)
+
+plot(i_showVWAP and inRTH ? vwapVal : na, "VWAP", color=color.new(color.blue, 0), linewidth=1, style=plot.style_linebr)
 
 // Reference levels.
 plot(i_showLvls and i_usePM ? pmH : na, "PM High", color=color.new(color.orange, 50), style=plot.style_circles)
