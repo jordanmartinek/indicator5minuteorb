@@ -602,23 +602,31 @@ stateStr = f_stateName(state)
 // new session starts fresh lines; the previous session's lines are left in
 // place as history.
 // =============================================================================
+// Persistent handles for the CURRENT session's ORB lines. They are created when
+// the range completes and their right edge (x2) is pushed to the current bar on
+// every subsequent bar of the session, so they draw as one continuous, anchored
+// horizontal level that tracks correctly on pan/zoom. A new session makes new
+// lines; previous sessions' lines remain as history.
 var line lnHigh = na
 var line lnMid  = na
 var line lnLow  = na
 
-// Start new ORB lines the moment the range completes (anchored at orbEndBar).
-if i_showORB and orbEnded
-    lnHigh := line.new(bar_index, orbHigh, bar_index, orbHigh, color=color.new(color.teal, 0), width=2)
-    lnLow  := line.new(bar_index, orbLow,  bar_index, orbLow,  color=color.new(color.maroon, 0), width=2)
-    if i_showMid
-        lnMid := line.new(bar_index, orbMid, bar_index, orbMid, color=color.new(color.gray, 40), width=1, style=line.style_dotted)
-
-// Extend the active ORB lines to the current bar through the RTH session.
-if i_showORB and orbReady and inRTH and not na(lnHigh)
-    line.set_x2(lnHigh, bar_index)
-    line.set_x2(lnLow,  bar_index)
-    if not na(lnMid)
-        line.set_x2(lnMid, bar_index)
+if i_showORB
+    // Create fresh lines the moment the ORB completes (anchored at this bar).
+    if orbEnded
+        lnHigh := line.new(bar_index, orbHigh, bar_index + 1, orbHigh, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.teal, 0), width=2)
+        lnLow  := line.new(bar_index, orbLow,  bar_index + 1, orbLow,  xloc=xloc.bar_index, extend=extend.none, color=color.new(color.maroon, 0), width=2)
+        lnMid  := i_showMid ? line.new(bar_index, orbMid, bar_index + 1, orbMid, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.gray, 40), width=1, style=line.style_dotted) : na
+    // Keep the levels pinned to the current price and push the right edge out
+    // every bar from the ORB completion through the end of the RTH session.
+    if orbReady and inRTH and not na(lnHigh)
+        line.set_xy1(lnHigh, orbEndBar, orbHigh)
+        line.set_xy2(lnHigh, bar_index, orbHigh)
+        line.set_xy1(lnLow,  orbEndBar, orbLow)
+        line.set_xy2(lnLow,  bar_index, orbLow)
+        if not na(lnMid)
+            line.set_xy1(lnMid, orbEndBar, orbMid)
+            line.set_xy2(lnMid, bar_index, orbMid)
 
 plot(i_showVWAP and inRTH ? vwapVal : na, "VWAP", color=color.new(color.blue, 0), linewidth=1, style=plot.style_linebr)
 
