@@ -1,262 +1,236 @@
-# NQ 5-Minute ORB Breakout Probability Engine
+# NQ 5-Minute ORB Breakout Probability Engine — v2
 
-A **probability-based analytical engine** for TradingView (Pine Script **v6**) that
-estimates — in real time and on history, **without repainting confirmed signals** —
-how a session is likely to break out of its first five-minute Opening Range (ORB).
-
-It is built for **Nasdaq futures (NQ)** on a **1-minute chart**, and works on ES and
-other liquid futures. It is **not** a buy/sell indicator: it quantifies the *evidence*
-for a breakout, estimates *first-passage direction*, and flags conditions associated
-with *chop* and *failed breakouts*.
-
-> **Honesty first.** The probabilities shipped here are a **transparent heuristic**.
-> Until you supply a calibration map derived from out-of-sample NQ data (see
-> [Validation](#6-validation-procedure)), the dashboard clearly labels them
-> **`UNCALIBRATED (heuristic)`**. Do not treat a heuristic score as a statistically
-> validated probability.
+A probability-based **forecasting engine** for TradingView (Pine Script **v6**) for the
+first five-minute New York RTH **Opening Range (ORB)**. It is **not** a buy/sell
+indicator. It estimates how likely a breakout is, which boundary is likely to break
+*first*, whether the move is likely to continue or fail, and — honestly — **how
+trustworthy those numbers are**.
 
 - **File:** [`NQ_ORB_Breakout_Probability_Engine.pine`](./NQ_ORB_Breakout_Probability_Engine.pine)
 
+> **Read this first.** The engine is defined on **confirmed 1-minute bars** and must be
+> run on a **1-minute chart**. On any other timeframe the dashboard shows a
+> `USE 1-MIN CHART` warning and **suppresses forecasts**, because the outcome labels
+> would change meaning. This is deliberate. You can keep this on a dedicated 1-minute
+> chart/layout tab for analysis while you execute on whatever timeframe you trade.
+>
+> The displayed probabilities are a **transparent heuristic and are NOT statistically
+> validated**. Until you perform the calibration in [Phase 5](#phase-5--historical-calibration--validation),
+> the dashboard labels them `UNCALIBRATED` and uses *score/estimate* wording. No trained
+> coefficients, backtests, or accuracy claims are fabricated.
+
 ---
 
-## 1. What it answers
+## 1. The forecasting contract
 
-1. **Is a breakout becoming more likely?** → *Breakout likelihood* and the per-feature evidence.
-2. **Which boundary breaks first?** → *UP-first* / *DOWN-first* / *NEITHER* first-passage probabilities.
-3. **Is the move real?** → *Continuation* score (displacement, volume, follow-through, VWAP, room).
-4. **Is this chop / a fake-out?** → *Failed-breakout risk* and a *RANGE / NO EDGE* state.
-5. **How reliable are the numbers?** → an explicit `CALIBRATED` vs `UNCALIBRATED` tag.
+### Timestamp & modes
+- The forecast operates on **each confirmed 1-minute bar after the ORB completes**.
+- **Rolling mode** (default): re-estimated every confirmed 1-min bar.
+- **Snapshot mode**: a single estimate frozen at ORB completion (09:35), never updated.
+
+### The three pre-breakout outcomes (mutually exclusive & exhaustive, over horizon H)
+| Outcome | Definition |
+|---|---|
+| **UPSIDE FIRST** | a confirmed 1-min close **above** ORB high occurs **before** any confirmed close below ORB low, **within H** |
+| **DOWNSIDE FIRST** | a confirmed 1-min close **below** ORB low occurs first, **within H** |
+| **NO BREAKOUT** | neither confirmed close occurs within H |
+
+`P(UPSIDE) + P(DOWNSIDE) + P(NO BREAKOUT) = 100%`.
+A **wick** beyond a boundary is **not** a break. If a single candle closes beyond **both**
+boundaries, the bar is **AMBIGUOUS** and excluded from the calibration dataset.
+A first confirmed close that lands **after H** is correctly labeled **NO BREAKOUT**, not
+directional.
+
+### The six probability concepts (kept separate)
+A. P(any break within H) B. P(upside-first) C. P(downside-first) D. P(no breakout)
+E. **Conditional** continuation after a confirmed break F. **Conditional** failure.
+Directional *evidence* is reported separately from *event probability* — a high
+upside-first share does **not** imply a high unconditional breakout probability if the
+chance of any break is low.
 
 ---
 
-## 2. The model (concise)
+## 2. Model mathematics (every displayed number defined)
 
-### Event definitions (precise, non-repainting)
+### Features → evidence (uncalibrated)
+Seven feature groups each produce a normalized score — signed in `[-1, 1]` (+bullish /
+−bearish) or magnitude in `[0, 1]`:
 
-- **ORB window** — bars inside the session `09:30–09:35 America/New_York`. On a 1-min
-  chart this is the single 09:30 candle. The high/low are **frozen** when the window ends.
-  DST is handled automatically by the named timezone.
-- **Breakout (default)** — a **confirmed 1-min close** strictly beyond an ORB boundary,
-  evaluated only on `barstate.isconfirmed`. A **wick** beyond the range is tracked as a
-  *probe* and is **never** treated as a breakout.
-- **First-passage outcomes** over the horizon *H* ∈ {5, 15, 30} min after the ORB:
-  - `UP_FIRST` — upper boundary closed through first, within H.
-  - `DOWN_FIRST` — lower boundary closed through first, within H.
-  - `NEITHER` — no confirmed close outside either boundary within H.
-  These are **mutually exclusive and exhaustive → they sum to 100%**.
-  *Overall breakout likelihood = 100% − P(NEITHER).*
+1. **ORB boundary pressure** — normalized distance to each boundary, boundary-test counts,
+   rejection depth, higher-low/lower-high structure; **persistent pressure** (shallow
+   rejection + supportive structure) is separated from **repeated rejection** (deep
+   rejection), so repeated tests alone do **not** raise breakout odds.
+2. **Candle anatomy** — body %, wick %, close location, consecutive closes, body
+   expansion, weakening countertrend wicks. Correlated cues are **combined inside the
+   group** (not stacked as independent weights) to limit double-counting.
+3. **Momentum & volatility** — ROC, momentum acceleration, ATR change, compression vs
+   expansion, and an **exhaustion** flag (big move + contracting vol). Three regimes are
+   distinguished: compression (energy+), healthy expansion (energy+), exhaustion (energy−).
+4. **Relative volume** — current volume vs a **time-of-day baseline** (same intraday slot
+   over the last *N* sessions, ~390-min RTH), plus up/down volume tilt. Degrades to a short
+   SMA when multi-session history is thin; shows `N/A` when volume is unavailable.
+5. **VWAP & structure** — side of VWAP, slope, crossings, HH/HL vs LH/LL (confirmed
+   pivots). **Chop** requires corroboration: many VWAP crossings **and** high candle
+   overlap — one crossing does not label the market choppy.
+6. **Room-to-travel** — distance from each boundary to the nearest opposing proxy level
+   (PMH/PML, ON H/L, PDH/PDL/PDC, confirmed swing pivots, user levels). Proxies only —
+   **not** resting liquidity.
+7. **Session conditions** — time since ORB, width, early volatility, optional news blackout.
 
-### Why this is not "RSI+MACD = probability"
-
-The engine keeps four concepts **strictly separate**:
-
-1. **Evidence** — each feature group produces a normalized score in `[-1, 1]` (signed)
-   or `[0, 1]` (magnitude). These are explicitly *heuristic*.
-2. **Direction** — net directional evidence `D` is mapped to UP vs DOWN by a **logistic**
-   (`pUp = sigmoid(k·D)`), producing a proper two-way split.
-3. **Volatility / compression / energy** — a separate `E ∈ [0, 1]` "escape energy"
-   term governs *whether any* break is likely, scaled by time remaining in the horizon.
-   Compression that precedes a break is distinguished from **exhaustion** that precedes
-   a reversal; compression alone is never directional evidence.
-4. **Failure risk** — a separate post-breakout score.
-
-The first-passage simplex is then:
-
+### Evidence → probability simplex
 ```
-P(UP_FIRST)  = E · pUp
-P(DOWN_FIRST)= E · pDn            (renormalized to sum to 100%)
-P(NEITHER)   = 1 − E
+D   = Σ wᵢ·featureᵢ              (net directional evidence, clamped to [-3, 3])
+pUp = sigmoid(k · D / 3)          pDn = 1 − pUp          (directional split)
+E   = clamp( energy · (0.4 + 0.6·timeLeft) · (1 − 0.4·chop) + 0.1·relVolScore , 0, 0.98 )
+P(UPSIDE)   = E · pUp
+P(DOWNSIDE) = E · pDn             → renormalized to sum to 100%
+P(NO BREAK) = 1 − E
+Breakout potential = 100% − P(NO BREAK)
 ```
+The logistic maps evidence to a (0,1) split; it does **not** prove those numbers match
+observed frequencies — that is what calibration is for.
 
-### Stage A — pre-breakout (feature groups)
-
-| Group | What it measures | Signed? |
-|---|---|---|
-| 1. Boundary pressure | tests of each boundary, rejection depth, higher-low/lower-high, persistent pressure **vs** repeated rejection | signed |
-| 2. Candle price action | body %, wick %, close location, consecutive closes, body expansion, weakening opposing wicks | signed |
-| 3. Momentum & volatility | ROC, momentum acceleration, ATR change, compression vs expansion, **exhaustion** detection | signed + energy |
-| 4. Relative volume | **time-of-day** baseline (same slot over N sessions), up/down volume tilt | magnitude + tilt |
-| 5. VWAP & structure | side of VWAP, VWAP slope, repeated crossings → chop, HH/HL vs LH/LL (confirmed pivots) | signed |
-| 6. Liquidity / levels | room-to-travel to PMH/PML, ON H/L, PDH/PDL/PDC, swing pivots, user levels | signed |
-| 7. Session conditions | time elapsed, ORB width, early volatility, optional news blackout | context |
-
-### Stage B — post-breakout
-
-Once a confirmed close occurs outside the ORB, the engine switches to **breakout-quality**:
-
-- **Continuation score** — breakout body %, displacement beyond range (×ORB width),
-  follow-through candle count, breakout relative volume, VWAP alignment, room-to-travel,
-  retest success.
-- **Failure risk** — close back inside the range, rejection wick against the break, weak
-  relative volume, absent follow-through, VWAP contradiction, no room to travel.
-
-### State machine
-
-`ORB FORMING → PRE-BREAKOUT → BREAKOUT CONFIRMED → CONTINUATION DEVELOPING | FAILED BREAKOUT`,
-plus `RANGE / NO EDGE`. Soft states use a configurable **min-dwell** to avoid flicker;
-**event-critical** states (breakout confirmed, continuation, failed breakout) commit
-**immediately** so a fast failure is never hidden.
+### Post-breakout (its own labels)
+- **Continuation**: price reaches `boundary ± contATR·ATR` (configurable) **after** the
+  break bar, before the failure condition and before the post-breakout horizon.
+- **Failure**: price meets the return-inside condition (confirmed close back inside the
+  ORB by default, or a stricter touch) before reaching the continuation target.
+- **Unresolved**: neither occurs before the horizon → labeled `UNRESOLVED` (not forced).
+- **Ambiguous**: both occur on the same candle → excluded from calibration.
+Continuation/failure also have supporting **uncalibrated evidence scores** for the dashboard.
 
 ---
 
-## 3. Install on TradingView
+## 3. Install & recommended NQ settings (1-minute)
 
-1. Open a **1-minute** chart of your instrument (e.g. `CME_MINI:NQ1!`).
-2. Open **Pine Editor** (bottom panel) → **Open** → *(or)* paste the full contents of
-   [`NQ_ORB_Breakout_Probability_Engine.pine`](./NQ_ORB_Breakout_Probability_Engine.pine).
-3. Click **Save**, then **Add to chart**.
-4. (Optional) Set chart timezone to *Exchange* or *America/New York* for visual alignment —
-   the engine's session logic already uses `America/New_York` internally regardless of the
-   chart's display timezone.
+1. Open a **1-minute** chart (e.g. `CME_MINI:NQ1!`).
+2. Pine Editor → paste [`NQ_ORB_Breakout_Probability_Engine.pine`](./NQ_ORB_Breakout_Probability_Engine.pine) → **Save** → **Add to chart**.
 
-The script auto-scales to other chart timeframes by converting the horizon from minutes
-to bars, but it is **designed and tuned for 1-minute**.
+| Input | Default |
+|---|---|
+| ORB window / timezone | `0930-0935` / `America/New_York` |
+| Forecast mode / horizon | Rolling / 15 min |
+| ATR / logistic k | 14 / 3.0 |
+| Touch tol / test lookback | 0.15×width / 20 |
+| Rel-vol baseline | 20 sessions |
+| Post-breakout horizon / target | 15 min / 1.0×ATR |
+| Min-dwell (anti-flicker) | 2 bars |
+| Calibration status / map | Uncalibrated / off |
 
----
-
-## 4. Default settings (NQ, 1-minute)
-
-| Input | Default | Notes |
-|---|---|---|
-| ORB window | `0930-0935` | first 5-min NY RTH candle |
-| Session timezone | `America/New_York` | DST-safe |
-| Horizon | `15 min` | options 5 / 15 / 30 |
-| ATR length | `14` | volatility normalization |
-| Logistic steepness `k` | `3.0` | sharpness of UP↔DOWN mapping |
-| Boundary-test lookback | `20` bars | |
-| Touch tolerance | `0.15` × ORB width | |
-| Rel-volume baseline | `20` sessions | time-of-day baseline |
-| Swing pivot length | `5` | confirmed (lagged) pivots |
-| Follow-through window | `3` bars | |
-| State min-dwell | `2` bars | anti-flicker for soft states |
-| Calibration map | **off (identity)** | → `UNCALIBRATED (heuristic)` |
-| Intrabar alerts | **off** | confirmed-bar logic only |
-| Repeated alerts | **off** | one alert per transition |
-
-Weights (directional evidence): pressure `1.0`, candle `1.0`, momentum `1.0`,
-VWAP `0.8`, levels `0.6`.
+Weights: pressure 1.0, candle 1.0, momentum 1.0, VWAP 0.8, room 0.6.
 
 ---
 
-## 5. Dashboard outputs
+## 4. Dashboard & market states
 
-| Row | Meaning | Color logic |
-|---|---|---|
-| **State** | current market state (see state machine) | green = breakout/continuation, orange = failed, gray = range, blue = forming/pre |
-| **Probabilities** | `CALIBRATED` or `UNCALIBRATED (heuristic)` | yellow until you calibrate |
-| **ORB High / Low** | frozen opening-range boundaries | neutral |
-| **ORB Width (pts)** | range size in points | neutral |
-| **Price location** | ABOVE / INSIDE / BELOW the range | neutral |
-| **UP-first P** | P(upper boundary breaks first) | green if dominant |
-| **DOWN-first P** | P(lower boundary breaks first) | red if dominant |
-| **NEITHER P** | P(no break within horizon) | gray |
-| **Breakout likelihood** | 100% − P(NEITHER) | green ≥ threshold |
-| **Continuation** | post-breakout quality (score, or % if calibrated) | green ≥ threshold, else yellow |
-| **Failed-breakout risk** | post-breakout failure risk (score, or %) | orange ≥ threshold |
-| **VWAP alignment** | BULLISH / BEARISH / MIXED | by side + slope |
-| **Volatility** | EXPANDING / COMPRESSING / NORMAL | |
-| **Relative volume** | HIGH / ABOVE AVG / LOW / N/A | green/red by level |
-| **Note** | `NEWS BLACKOUT`, `Volume unavailable`, or `Heuristic model` | |
+**Rows:** symbol·timeframe·horizon, timeframe warning (if not 1-min), **State**, **Mode**,
+**Calibration status**, ORB high/low, width, price location, **Breakout potential**,
+**Upside-first**, **Downside-first**, **No breakout**, **Directional evidence**,
+**Continuation**, **Failure risk**, VWAP alignment, Volatility, Relative volume, Chop, Note.
+Calibrated probabilities show `%`; uncalibrated outputs show `(score)` — they are never
+mixed to look equivalent. Colors: green = bullish, red = bearish, amber = uncertainty /
+failure risk, gray = range / insufficient.
 
-Color key: **green** = bullish evidence, **red** = bearish evidence,
-**yellow/amber** = uncertainty / elevated failure risk, **gray** = range / insufficient evidence.
-Use *Minimal dashboard* to collapse to the core rows, and choose any corner position.
+**States (explicit entry/exit):**
+`ORB FORMING → PRE-BREAKOUT → RANGE / NO EDGE ↔ BREAKOUT CONFIRMED → CONTINUATION DEVELOPING | FAILED BREAKOUT`, plus `INSUFFICIENT DATA`.
+`RANGE / NO EDGE` is entered when evidence is weak/contradictory/choppy or the horizon
+elapses without a break. Event-critical states commit immediately; soft states respect a
+min-dwell to avoid per-candle flicker.
 
-### Chart plots (each toggleable)
-ORB high, ORB low, optional ORB midpoint, session VWAP, optional PM/ON/PD levels,
-small confirmed **breakout** markers, **failed-breakout** markers, and optional **retest** markers.
+**Chart:** anchored ORB high/low (drawn with `line.new`, so they stay pinned on pan/zoom),
+optional midpoint/VWAP/PM/ON/PD levels, small confirmed breakout / failed-breakout / retest
+markers. Historical markers do not move when new bars arrive.
 
 ---
 
-## 6. Validation procedure
-
-**The indicator ships UNCALIBRATED.** Here is the repeatable workflow to validate and
-calibrate it against real NQ sessions, out-of-sample and in chronological order.
-
-### A. Define outcomes (already matches the engine)
-- Pre-breakout: for each session, label `UP_FIRST` / `DOWN_FIRST` / `NEITHER` within the horizon.
-- Post-breakout: label **successful continuation** vs **failed breakout** using documented
-  thresholds (e.g. continuation = price advances ≥ 1 ORB width beyond the boundary before
-  returning inside; failure = confirmed close back inside within N bars).
-
-### B. Export the heuristic scores
-On a 1-minute NQ chart, read, per session, at the moment the horizon window opens:
-`Breakout likelihood`, `UP-first P`, `DOWN-first P`, `Continuation`, `Failed-breakout risk`.
-Export via TradingView alerts/webhooks or by stepping the replay and recording the dashboard
-values (or add temporary `plot()`/`label` lines and use *Export chart data*).
-
-### C. Build the calibration map (external)
-With the exported `(heuristic_score, realized_outcome)` pairs:
-1. **Split chronologically** — earlier sessions = fit, later sessions = out-of-sample test.
-   **Never randomly mix** future and past observations.
-2. Bucket scores (e.g. 0–25, 25–50, 50–75, 75–100) and compute the **empirical hit rate**
-   per bucket on the fit set.
-3. Those empirical rates become the calibration knot `y`-values.
-
-### D. Evaluate (on the out-of-sample set)
-- **Brier score** and **log loss** (lower = better).
-- **Reliability diagram** / probability-bucket calibration table (predicted vs realized).
-- **Accuracy by probability bucket** and **false-breakout rate**.
-- Slice by **volatility regime** and **time of day**.
-- **MFE / MAE** after breakout; account for **transaction costs & slippage**.
-- Treat overlapping prediction windows and multiple observations from the same session as
-  **correlated** — do not count them as independent samples.
-
-### E. Load the calibration back in
-Enter the per-bucket rates in the **Probability Calibration Map** inputs
-(`Calibrated P at score=0/25/50/75/100`) and toggle **Enable calibration map** on.
-The dashboard flips to `CALIBRATED`. The piecewise-linear map is applied to the breakout,
-continuation, and failure scores; the directional split is preserved and renormalized.
-
-> If you cannot complete calibration, leave it off. The dashboard will keep telling the
-> truth: **UNCALIBRATED (heuristic)**.
+## 5. Alerts
+Breakout potential / upside-first / downside-first crossing thresholds; confirmed close
+above/below the ORB; failed breakout; successful retest; deteriorating continuation; and
+entering/leaving `RANGE / NO EDGE`. All are **1-minute-gated** and fire once per transition
+unless *repeated alerts* is enabled. Intrabar alerts are a clearly-labeled opt-in. Messages
+include symbol, state, horizon, ORB boundaries, and the relevant score/probability.
 
 ---
 
-## 7. Non-repainting guarantees
+## Phase 5 — historical calibration & validation
 
-- Model state, breakouts, and state transitions use **confirmed bars** by default
-  (`barstate.isconfirmed`). An opt-in *Intrabar alerts* switch is clearly labeled as
-  potentially repainting alert timing.
-- Breakouts are **confirmed closes**, never wicks.
-- `request.security` (previous-day H/L/C) uses `lookahead=barmerge.lookahead_off` on
-  prior-bar values → no future leakage.
-- Structure uses **symmetric, lagged** pivots that only resolve after the fact → no
-  forward peek in live predictions.
-- Per-session state (ORB, breakout flags, retest) resets on the first ORB bar of each session.
-- All divisions are guarded; probabilities are clamped and renormalized; volume absence is
-  handled gracefully.
+Pine does the **live** features/dashboard/plots/alerts. Robust statistical calibration is
+done **externally**; the indicator exposes the data you need.
+
+### A. Export (in TradingView)
+Enable **Research Export → "Plot machine-readable export series"**. This adds, in the Data
+Window / exported CSV, per bar:
+`EXP_pUp, EXP_pDn, EXP_pNone, EXP_dirEv, EXP_contScore, EXP_failScore, EXP_preOutcome, EXP_postOutcome`.
+`EXP_preOutcome` is emitted **only when the outcome is resolved** (after H): `1` upside-first,
+`-1` downside-first, `0` no-breakout, `8` ambiguous. `EXP_postOutcome`: `1` continuation,
+`-1` failure, `9` unresolved, `8` ambiguous. Use *Export chart data* (or alert/webhook logging)
+across as many NQ 1-min sessions as available (target several hundred+).
+
+### B. Calibrate (external: Python/R)
+1. Join each forecast row to its **realized** `EXP_preOutcome` label.
+2. **Chronological split**: early = develop, middle = calibrate, later untouched = test.
+   Use walk-forward where feasible. **Never randomly mix** past/future.
+3. Group observations **by session** (overlapping rolling forecasts are correlated — do not
+   treat them as independent samples).
+4. Fit a reference first (historical base rates, a simple directional model), then a
+   **multinomial logistic regression** on the three outcomes. Only adopt complexity that
+   beats the reference **out-of-sample**.
+5. Build the probability map and read off empirical hit-rates for score buckets
+   0/25/50/75/100.
+
+### C. Evaluate (out-of-sample)
+Brier score, log loss, reliability diagram, accuracy by probability bucket, up/down/no-break
+frequencies, false-breakout rate, continuation/failure rates, MFE/MAE, and performance by
+**volatility regime** and **time of day**. Any profitability statement must include
+commissions, slippage, and the full outcome distribution — predicting direction is not profit.
+
+### D. Load back in
+Enter the bucket hit-rates in the **Probability Calibration Map** inputs, toggle **Apply
+calibration map**, and set **Calibration status** to *Calibrated – limited data* or
+*Calibrated – validation available* per your evidence. The dashboard then reports
+`CALIBRATED` and switches scores to `%`. If you can't complete this, leave it `Uncalibrated`.
+
+> The `Calibration status` input is an **honesty flag you set** — it is not computed and does
+> not itself validate anything. Do not set it to *validated* without out-of-sample evidence.
+
+---
+
+## Phase 7 — non-repainting protections
+Confirmed-bar logic by default (`barstate.isconfirmed`); breakouts are confirmed **closes**,
+never wicks; `request.security` daily levels use `lookahead_off` on prior-bar values;
+structure uses **lagged** symmetric pivots; per-session state resets on the first ORB bar;
+divisions guarded; probabilities clamped & renormalized; graceful handling of missing volume,
+insufficient history, and non-1-min timeframes. A historical forecast reflects only
+information available at its timestamp.
 
 ---
 
-## 8. Known limitations
+## Tests performed (honest status)
+**Performed (static / structural):** Pine v6 structural validation (balanced
+parentheses/brackets, no tabs, no `ta.*`/`math.sum` inside ternary branches, `plotshape`
+locations are constants, no `na` booleans, no global mutation inside functions); two
+behavioral review passes incorporated (three-outcome horizon bound, latched NO-BREAKOUT
+resolution, continuation requires post-break follow-through, explicit 1-min alert gating,
+simplex-degeneracy fallback, time-of-day volume baseline, stale-level expiry, anchored
+non-floating ORB lines).
 
-- **Heuristic until calibrated.** The shipped probabilities are not statistically validated.
-- **Volume is not order flow.** TradingView volume ≠ true bid/ask flow; relative volume uses
-  a time-of-day baseline and degrades to a short SMA when multi-session history is thin, and
-  shows `N/A` when volume is unavailable (common on some FX/index feeds).
-- **"Liquidity" is a proxy.** PM/ON/PD levels and swing pivots are **price-level proxies**,
-  not real resting institutional orders or a full order book.
-- **One ORB per session.** Designed for a single RTH opening range per day.
-- **Timeframe.** Tuned for 1-minute; other timeframes auto-scale the horizon but are not tuned.
-- **Session assumptions.** Rel-volume baseline assumes a ~390-minute RTH; adjust for products
-  with different session lengths.
-
----
-
-## 9. Prioritized remaining work
-
-1. **Calibration data pipeline** — the single highest-value item; follow Section 6 to turn
-   heuristic scores into validated probabilities.
-2. **True same-minute volume baseline** — the current time-of-day baseline approximates the
-   session as 390 minutes; a calendar-exact same-timestamp baseline would be more precise.
-3. **Regime-conditional weights** — allow the feature weights / logistic `k` to vary by
-   volatility regime once calibration data exists.
-4. **Multi-timeframe confirmation** — optional higher-timeframe trend context behind a
-   `lookahead_off` request.
-5. **Automated outcome logging** — a companion export mode (plots/labels) to make Section 6
-   data collection one click.
+**NOT yet performed (requires the external workflow above):** empirical calibration; Brier/
+log-loss/reliability; out-of-sample accuracy; regime/time-of-day slicing; MFE/MAE; feature
+ablation. **No accuracy or profitability claims are made.** The dashboard reports
+`UNCALIBRATED` until you complete Phase 5.
 
 ---
+
+## Known limitations & roadmap
+**Limitations:** heuristic until calibrated; 1-minute-native by design; TradingView volume ≠
+order flow; "liquidity" = price-structure proxies; one ORB per session; RTH assumed ~390 min.
+
+**Prioritized roadmap:**
+1. Complete the external calibration pipeline (highest value).
+2. Multinomial-logistic coefficients transferred into the calibration map; versioned.
+3. Feature ablation to drop non-contributing groups and reduce double-counting.
+4. Regime-conditional weights / logistic `k` once calibrated.
+5. Optional ES confirmation for NQ — only if it improves out-of-sample results.
+6. Calendar-exact same-timestamp volume baseline (vs the current ~390-min approximation).
 
 *This tool is for analysis and education. It is not financial advice.*

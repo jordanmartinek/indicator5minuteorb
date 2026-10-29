@@ -1,88 +1,111 @@
 //@version=6
 // =============================================================================
-// NQ 5-Minute ORB Breakout Probability Engine
+// NQ 5-Minute ORB Breakout Probability Engine  —  v2 (spec rebuild)
+// =============================================================================
+// A probability-based FORECASTING engine (NOT a buy/sell indicator) for the
+// first 5-minute New York RTH Opening Range (ORB). It answers:
+//   1. How likely is a confirmed break of either boundary within the horizon?
+//   2. Which boundary is more likely to break FIRST?
+//   3. Is the evidence favoring a breakout, or chop / no-edge?
+//   4. After a confirmed break: continuation vs failure vs unresolved?
+//   5. How trustworthy are the numbers (calibration status)?
+//
 // -----------------------------------------------------------------------------
-// A probability-based analytical engine (NOT a buy/sell indicator) that
-// estimates, for the first 5-minute Opening Range of the New York RTH session:
+// FORECASTING CONTRACT (read this before trusting any number)
+// -----------------------------------------------------------------------------
+// * TIMEFRAME: the engine is defined on CONFIRMED 1-MINUTE bars. Outcome labels
+//   ("a confirmed 1-min candle closes beyond the boundary") are only reproducible
+//   on a 1-minute chart. Run this on a 1-MINUTE chart (a separate layout/tab is
+//   fine while you execute elsewhere). On any other timeframe the dashboard shows
+//   a WRONG-TIMEFRAME warning and suppresses forecasts, because the labels would
+//   change meaning. This is deliberate honesty, not a bug.
 //
-//   A. P(a breakout of either ORB boundary within the horizon)
-//   B. Directional first-passage probabilities: UP-first / DOWN-first / NEITHER
-//   C. Breakout CONTINUATION quality (post-breakout)
-//   D. FAILED-breakout risk (post-breakout)
+// * THREE PRE-BREAKOUT OUTCOMES (mutually exclusive & exhaustive), over horizon H:
+//     UPSIDE FIRST   - a confirmed 1-min close ABOVE ORB high occurs before any
+//                      confirmed close BELOW ORB low, within H.
+//     DOWNSIDE FIRST - a confirmed 1-min close BELOW ORB low occurs first, within H.
+//     NO BREAKOUT    - neither confirmed close occurs within H.
+//   => P(UP) + P(DOWN) + P(NONE) = 1. A wick beyond a boundary is NOT a break.
+//   If both boundaries are closed through on the SAME bar, the bar is AMBIGUOUS
+//   and excluded from the calibration dataset.
 //
-// DESIGN PRINCIPLES
-//   * Raw heuristic EVIDENCE is kept strictly separate from PROBABILITIES.
-//   * A user-editable CALIBRATION MAP converts heuristic scores into calibrated
-//     probabilities. Seeded as identity => shown as "UNCALIBRATED (heuristic)"
-//     until the trader supplies out-of-sample calibration (see Section 6 doc).
-//   * Non-repainting: model updates use CONFIRMED bars by default. Breakouts are
-//     confirmed CLOSES beyond the range, never wicks. Pivots used for structure
-//     are confirmed (lagged) pivots only -> no look-ahead.
-//   * First-passage outcomes UP/DOWN/NEITHER are mutually exclusive & exhaustive
-//     and therefore sum to 100%. Overall breakout likelihood = 100% - P(NEITHER).
+// * TWO FORECAST MODES:
+//     ROLLING  - re-estimated on every confirmed 1-min bar after ORB completion.
+//     SNAPSHOT - a single fixed estimate anchored at ORB completion (09:35).
 //
-// LIMITATIONS (also surfaced on the dashboard):
-//   * Probabilities are HEURISTIC until calibrated with real NQ data.
-//   * TradingView volume is not true order flow; rel-volume degrades gracefully.
-//   * "Liquidity" uses price-level proxies, not real resting orders.
+// * EVIDENCE vs PROBABILITY: feature groups produce UNCALIBRATED evidence scores.
+//   They are mapped to a probability simplex via a documented logistic/softmax,
+//   but that mapping is NOT empirically validated. Until you load a calibration
+//   map derived from out-of-sample NQ data, the dashboard labels outputs
+//   UNCALIBRATED and uses "score/estimate" wording — never "73% probability".
+//
+// * POST-BREAKOUT uses its OWN labels (continuation / failure / UNRESOLVED) and
+//   does NOT reuse pre-breakout probabilities.
+//
+// * NON-REPAINTING: all model updates, breakouts, and state transitions use
+//   CONFIRMED bars (barstate.isconfirmed). request.security (daily levels) uses
+//   lookahead_off on prior-bar values. Pivots are symmetric/lagged. Historical
+//   markers do not move when new bars arrive.
+//
+// LIMITATIONS: TradingView volume is NOT true order flow; "liquidity" levels are
+// price-structure proxies, not resting orders; probabilities are heuristic until
+// calibrated. See the README for the full validation workflow.
 // =============================================================================
 
-indicator("NQ 5-Min ORB Breakout Probability Engine", shorttitle="ORB-PROB", overlay=true, max_lines_count=500, max_labels_count=100, max_boxes_count=20)
+indicator("NQ 5-Min ORB Breakout Probability Engine v2", shorttitle="ORB-PROB v2", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
 
 // =============================================================================
 // SECTION 0 : INPUTS
 // =============================================================================
-// ---- Session / ORB -----------------------------------------------------------
 grpSession   = "Session & Opening Range"
 i_orbSession = input.session("0930-0935", "ORB window (session)", tooltip="First 5-minute Opening Range of the NY RTH session. On a 1-min chart this is the 09:30 candle.", group=grpSession)
 i_tz         = input.string("America/New_York", "Session timezone", tooltip="Named zone => DST handled automatically.", group=grpSession)
-i_rthSession = input.session("0930-1600", "Regular session (for VWAP/vol baseline)", group=grpSession)
+i_rthSession = input.session("0930-1600", "Regular session (VWAP / vol baseline)", group=grpSession)
 
-// ---- Prediction horizon ------------------------------------------------------
-grpHorizon   = "Prediction Horizon"
-i_horizon    = input.string("15 min", "Horizon", options=["5 min", "15 min", "30 min"], tooltip="Window (after the ORB completes) within which the first-passage outcome is evaluated.", group=grpHorizon)
+grpForecast  = "Forecast"
+i_mode       = input.string("Rolling", "Forecast mode", options=["Rolling","Snapshot (at ORB completion)"], tooltip="Rolling re-estimates every confirmed 1-min bar. Snapshot freezes one estimate at 09:35.", group=grpForecast)
+i_horizon    = input.string("15 min", "Horizon", options=["5 min","15 min","30 min"], group=grpForecast)
 
-// ---- Thresholds / alerts -----------------------------------------------------
-grpThresh    = "Thresholds"
-i_breakThr   = input.float(60.0, "Alert: breakout likelihood >= (%)", minval=1, maxval=99, group=grpThresh)
-i_upThr      = input.float(60.0, "Alert: UP-first probability >= (%)", minval=1, maxval=99, group=grpThresh)
-i_dnThr      = input.float(60.0, "Alert: DOWN-first probability >= (%)", minval=1, maxval=99, group=grpThresh)
-i_failThr    = input.float(60.0, "Failed-breakout risk flag >= (%)", minval=1, maxval=99, group=grpThresh)
+grpThresh    = "Thresholds & Alerts"
+i_breakThr   = input.float(60.0, "Alert: breakout potential >= (%)", minval=1, maxval=99, group=grpThresh)
+i_upThr      = input.float(60.0, "Alert: upside-first >= (%)", minval=1, maxval=99, group=grpThresh)
+i_dnThr      = input.float(60.0, "Alert: downside-first >= (%)", minval=1, maxval=99, group=grpThresh)
+i_failThr    = input.float(60.0, "Failure-risk flag >= (%)", minval=1, maxval=99, group=grpThresh)
 i_contThr    = input.float(55.0, "Continuation 'developing' >= (%)", minval=1, maxval=99, group=grpThresh)
-i_repeat     = input.bool(false, "Allow repeated alerts (every bar)", tooltip="Off => alerts fire once per state transition.", group=grpThresh)
-i_intrabar   = input.bool(false, "Intrabar alerts (may repaint alert timing)", tooltip="Off (default) => confirmed-bar logic only, non-repainting.", group=grpThresh)
+i_repeat     = input.bool(false, "Allow repeated alerts (every bar)", group=grpThresh)
+i_intrabar   = input.bool(false, "Intrabar alerts (may repaint timing)", group=grpThresh)
 
-// ---- Model parameters --------------------------------------------------------
 grpModel     = "Model Parameters"
 i_atrLen     = input.int(14, "ATR length", minval=2, group=grpModel)
-i_logisticK  = input.float(3.0, "Logistic steepness k (directional)", minval=0.1, maxval=12, step=0.1, tooltip="Higher => directional evidence maps more sharply to UP vs DOWN.", group=grpModel)
+i_logisticK  = input.float(3.0, "Logistic steepness k (directional)", minval=0.1, maxval=12, step=0.1, group=grpModel)
 i_testLook   = input.int(20, "Boundary-test lookback (bars)", minval=3, group=grpModel)
 i_touchTol   = input.float(0.15, "Boundary touch tolerance (x ORB width)", minval=0.01, maxval=1.0, step=0.01, group=grpModel)
-i_rvolLen    = input.int(20, "Rel-volume baseline (same-time days)", minval=3, tooltip="Time-of-day adjusted baseline: average volume of this intraday minute over the last N sessions.", group=grpModel)
+i_rvolLen    = input.int(20, "Rel-volume baseline (same-time sessions)", minval=3, group=grpModel)
 i_pivLen     = input.int(5, "Swing pivot length", minval=2, group=grpModel)
-i_followN    = input.int(3, "Follow-through window (bars)", minval=1, maxval=20, group=grpModel)
 i_minDwell   = input.int(2, "State min-dwell (bars, anti-flicker)", minval=0, maxval=20, group=grpModel)
+i_chopCross  = input.int(6, "VWAP crossings for chop (in 20 bars)", minval=2, maxval=20, group=grpModel)
 
-// ---- Feature-group weights (transparent, documented) -------------------------
+grpPost      = "Post-Breakout Model"
+i_postHorz   = input.int(15, "Post-breakout observation horizon (min)", minval=2, maxval=120, group=grpPost)
+i_contATR    = input.float(1.0, "Continuation target (x ATR beyond boundary)", minval=0.1, maxval=10, step=0.1, group=grpPost)
+i_failInside = input.bool(true, "Failure requires confirmed close back INSIDE ORB", tooltip="Off => failure also triggers on a return-inside threshold touch.", group=grpPost)
+
 grpWeights   = "Directional Evidence Weights"
 w_pressure   = input.float(1.0, "W: boundary pressure",  minval=0, maxval=3, step=0.1, group=grpWeights)
-w_candle     = input.float(1.0, "W: candle price action", minval=0, maxval=3, step=0.1, group=grpWeights)
+w_candle     = input.float(1.0, "W: candle anatomy",     minval=0, maxval=3, step=0.1, group=grpWeights)
 w_momentum   = input.float(1.0, "W: momentum",           minval=0, maxval=3, step=0.1, group=grpWeights)
 w_vwap       = input.float(0.8, "W: VWAP / structure",   minval=0, maxval=3, step=0.1, group=grpWeights)
-w_levels     = input.float(0.6, "W: room-to-travel (levels)", minval=0, maxval=3, step=0.1, group=grpWeights)
+w_levels     = input.float(0.6, "W: room-to-travel",     minval=0, maxval=3, step=0.1, group=grpWeights)
 
-// ---- Calibration map (identity by default => UNCALIBRATED) -------------------
-// Piecewise-linear map on knots [0,25,50,75,100]. Edit the y-values with
-// externally derived calibration (Section 6). Equal to x => identity => flagged.
 grpCal       = "Probability Calibration Map"
-i_calEnable  = input.bool(false, "Enable calibration map", tooltip="When OFF (and/or identity), dashboard shows UNCALIBRATED (heuristic).", group=grpCal)
+i_calStatus  = input.string("Uncalibrated", "Calibration status", options=["Uncalibrated","Calibrated - limited data","Calibrated - validation available"], tooltip="Set this ONLY after performing the external validation in the README. It is an honesty flag, not a computation.", group=grpCal)
+i_calEnable  = input.bool(false, "Apply calibration map", group=grpCal)
 cal_y0       = input.float(0.0,   "Calibrated P at score=0",   minval=0, maxval=100, group=grpCal)
 cal_y25      = input.float(25.0,  "Calibrated P at score=25",  minval=0, maxval=100, group=grpCal)
 cal_y50      = input.float(50.0,  "Calibrated P at score=50",  minval=0, maxval=100, group=grpCal)
 cal_y75      = input.float(75.0,  "Calibrated P at score=75",  minval=0, maxval=100, group=grpCal)
 cal_y100     = input.float(100.0, "Calibrated P at score=100", minval=0, maxval=100, group=grpCal)
 
-// ---- Liquidity / reference levels -------------------------------------------
 grpLevels    = "Reference Levels"
 i_usePM      = input.bool(true,  "Use premarket high/low", group=grpLevels)
 i_pmSession  = input.session("0400-0930", "Premarket session", group=grpLevels)
@@ -92,12 +115,13 @@ i_usePD      = input.bool(true,  "Use previous-day H/L/C", group=grpLevels)
 i_userLvl1   = input.float(0.0,  "User level 1 price (0=off)", group=grpLevels)
 i_userLvl2   = input.float(0.0,  "User level 2 price (0=off)", group=grpLevels)
 
-// ---- News blackout -----------------------------------------------------------
 grpNews      = "News Blackout (optional)"
 i_newsOn     = input.bool(false, "Enable news blackout", group=grpNews)
-i_newsSess   = input.session("0829-0831", "Blackout session", tooltip="During blackout the engine suppresses new breakout/alert state transitions.", group=grpNews)
+i_newsSess   = input.session("0829-0831", "Blackout session", group=grpNews)
 
-// ---- Display -----------------------------------------------------------------
+grpExport    = "Research Export (for calibration)"
+i_export     = input.bool(false, "Plot machine-readable export series", tooltip="Exposes forecast scores + realized outcome codes as plots so you can 'Export chart data' and calibrate externally (see README Phase 5).", group=grpExport)
+
 grpDisp      = "Display"
 i_showDash   = input.bool(true,  "Show dashboard", group=grpDisp)
 i_dashPos    = input.string("Top Right", "Dashboard position", options=["Top Right","Bottom Right","Top Left","Bottom Left"], group=grpDisp)
@@ -112,22 +136,16 @@ i_showRetest = input.bool(true,  "Show retest markers", group=grpDisp)
 // =============================================================================
 // SECTION 1 : HELPERS
 // =============================================================================
-// Clamp a value into [lo, hi].
 f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
-
-// Safe division (returns `fallback` on zero / na denominator).
 f_safeDiv(float a, float b, float fallback) => (na(b) or b == 0.0) ? fallback : a / b
-
-// Logistic / sigmoid.
 f_sigmoid(float x) => 1.0 / (1.0 + math.exp(-x))
 
-// Piecewise-linear calibration on knots [0,25,50,75,100] -> returns % in [0,100].
-// `score` is a 0..100 heuristic. Identity mapping when inputs unchanged.
+// Piecewise-linear calibration on knots [0,25,50,75,100] -> % in [0,100].
 f_calibrate(float score) =>
     s = f_clamp(score, 0.0, 100.0)
     float y = na
     if s <= 25.0
-        y := cal_y0 + (cal_y25 - cal_y0) * (s - 0.0) / 25.0
+        y := cal_y0 + (cal_y25 - cal_y0) * (s) / 25.0
     else if s <= 50.0
         y := cal_y25 + (cal_y50 - cal_y25) * (s - 25.0) / 25.0
     else if s <= 75.0
@@ -136,81 +154,89 @@ f_calibrate(float score) =>
         y := cal_y75 + (cal_y100 - cal_y75) * (s - 75.0) / 25.0
     f_clamp(y, 0.0, 100.0)
 
-// Is the calibration map a non-identity map AND enabled?
-isCalibrated = i_calEnable and (cal_y0 != 0.0 or cal_y25 != 25.0 or cal_y50 != 50.0 or cal_y75 != 75.0 or cal_y100 != 100.0)
+isCalMapIdentity = cal_y0 == 0.0 and cal_y25 == 25.0 and cal_y50 == 50.0 and cal_y75 == 75.0 and cal_y100 == 100.0
+applyCal   = i_calEnable and not isCalMapIdentity
+// Calibration status is an explicit honesty flag chosen by the user.
+calibrated = applyCal and (i_calStatus != "Uncalibrated")
 
-// Horizon in bars (1-min chart assumed as primary; falls back to minutes).
-horizonMin = i_horizon == "5 min" ? 5 : i_horizon == "15 min" ? 15 : 30
-// Chart timeframe in minutes (>=1). Used to convert horizon minutes -> bars.
+// ---- Timeframe guard --------------------------------------------------------
+// The engine is 1-minute-native. On other timeframes forecasts are suppressed.
+isOneMin   = timeframe.in_seconds() == 60
 tfMin      = math.max(1.0, timeframe.in_seconds() / 60.0)
-horizonBars = math.max(1, int(math.round(horizonMin / tfMin)))
+
+horizonMin = i_horizon == "5 min" ? 5 : i_horizon == "15 min" ? 15 : 30
+horizonBars = math.max(1, int(math.round(horizonMin / tfMin)))   // == horizonMin on 1-min
+postHorzBars = math.max(1, int(math.round(i_postHorz / tfMin)))
+rollingMode  = i_mode == "Rolling"
 
 // =============================================================================
-// SECTION 2 : SESSION / ORB DETECTION  (non-repainting, DST-safe via named TZ)
+// SECTION 2 : SESSION / ORB DETECTION  (non-repainting, DST-safe)
 // =============================================================================
 inORB      = not na(time(timeframe.period, i_orbSession, i_tz))
 inRTH      = not na(time(timeframe.period, i_rthSession, i_tz))
-newSession = inORB and not inORB[1]          // first bar of a new ORB window
-orbEnded   = (not inORB) and inORB[1]         // bar right after ORB completes
+newSession = inORB and not inORB[1]
+orbEnded   = (not inORB) and inORB[1]
 
-var float orbHigh   = na
-var float orbLow    = na
-var float orbMid    = na
-var bool  orbReady  = false                   // ORB fully formed this session
-var int   orbEndBar = na                      // bar_index when ORB completed
+var float orbHigh    = na
+var float orbLow     = na
+var float orbMid     = na
+var bool  orbReady   = false
+var int   orbEndBar  = na
+var int   orbBars    = 0        // how many bars were captured in the ORB window
 
-// Accumulate the ORB high/low during the window.
 if newSession
     orbHigh  := high
     orbLow   := low
     orbReady := false
+    orbBars  := 1
 else if inORB
     orbHigh  := math.max(orbHigh, high)
     orbLow   := math.min(orbLow, low)
+    orbBars  += 1
 
-// Freeze ORB when the window ends.
 if orbEnded
     orbMid    := (orbHigh + orbLow) / 2.0
     orbReady  := true
     orbEndBar := bar_index
 
-orbWidth   = (orbReady or inORB) ? (orbHigh - orbLow) : na
+orbWidth     = (orbReady or inORB) ? (orbHigh - orbLow) : na
 barsSinceORB = orbReady ? (bar_index - orbEndBar) : na
-withinHorizon = orbReady and not na(barsSinceORB) and barsSinceORB <= horizonBars
+withinHorizon = orbReady and not na(barsSinceORB) and barsSinceORB >= 1 and barsSinceORB <= horizonBars
+// A valid ORB needs at least one captured bar and a positive, finite width.
+orbValid     = orbReady and not na(orbWidth) and orbWidth > 0 and orbBars >= 1
 
-// Reset per-session breakout bookkeeping when a NEW ORB starts forming.
-var int   firstBreakDir = 0                   // +1 up-first, -1 down-first, 0 none
+// Per-session reset of breakout bookkeeping.
+var int   firstBreakDir = 0      // +1 up-first, -1 down-first, 0 none, 2 ambiguous
 var int   breakBar      = na
+var float breakAtr      = na     // ATR snapshot at break (for continuation target)
 var bool  failedBreak   = false
+var bool  continued     = false
 var bool  retestDone    = false
+var int   postOutcome   = 0      // 0 open, 1 continuation, -1 failure, 9 unresolved, 8 ambiguous
 if newSession
     firstBreakDir := 0
     breakBar      := na
+    breakAtr      := na
     failedBreak   := false
+    continued     := false
     retestDone    := false
+    postOutcome   := 0
 
 // =============================================================================
-// SECTION 3 : CORE SERIES (ATR, VWAP, volume baseline)
+// SECTION 3 : CORE SERIES
 // =============================================================================
 atr      = ta.atr(i_atrLen)
 atrPrev  = atr[i_atrLen]
-atrChg   = f_safeDiv(atr - atrPrev, atrPrev, 0.0)              // ATR rate of change
+atrChg   = f_safeDiv(atr - atrPrev, atrPrev, 0.0)
 
-// Session-anchored VWAP (resets each RTH session). ta.vwap anchors on the
-// series passed to `anchor`; we anchor on RTH start.
 rthStart = inRTH and not inRTH[1]
 vwapVal  = ta.vwap(hlc3, rthStart)
 vwapSlope = vwapVal - vwapVal[3]
 
-// Volume availability + TIME-OF-DAY adjusted relative volume.
 volOk = not na(volume) and volume > 0
-// Time-of-day baseline: compare the current bar against the SAME intraday slot
-// on the previous N sessions. We approximate one RTH session as 390 minutes
-// (6.5h) worth of bars and look back in whole-session multiples. This matches
-// the stated intent (same minute across sessions) far better than a flat SMA.
-// Falls back to a short rolling SMA if there isn't enough multi-session history.
+// Time-of-day baseline: same intraday slot across previous N sessions (~390-min RTH).
 rthBarsPerDay = math.max(1, int(math.round(390.0 / tfMin)))
-volFallback   = ta.sma(volume, 20)              // computed every bar (ta state safe)
+volFallback   = ta.sma(volume, 20)
 f_todBaseline(float fallback) =>
     float acc = 0.0
     int   cnt = 0
@@ -222,14 +248,11 @@ f_todBaseline(float fallback) =>
             cnt += 1
     cnt >= 3 ? acc / cnt : fallback
 volTodBase = f_todBaseline(volFallback)
-relVol     = volOk ? f_safeDiv(volume, volTodBase, 1.0) : na    // ~1.0 == typical for this time-of-day
+relVol     = volOk ? f_safeDiv(volume, volTodBase, 1.0) : na
 
 // =============================================================================
-// SECTION 4 : REFERENCE LEVELS (price-level proxies; NOT real order flow)
+// SECTION 4 : REFERENCE LEVELS (price-structure proxies; NOT order flow)
 // =============================================================================
-// Captures the high/low of a session. `newDay` invalidates stale values at the
-// start of each trading day so room-to-travel never leans on a PRIOR day's
-// premarket/overnight extremes before the current day's session has formed.
 f_sessHiLo(string sess, bool newDay) =>
     bool isIn = not na(time(timeframe.period, sess, i_tz))
     var float hi = na
@@ -246,17 +269,14 @@ f_sessHiLo(string sess, bool newDay) =>
         lo := na(lo) ? low  : math.min(lo, low)
     [hi, lo]
 
-// New trading day in the session timezone (used to expire stale levels).
 newDay = dayofmonth(time, i_tz) != dayofmonth(time[1], i_tz)
 [pmH, pmL] = f_sessHiLo(i_pmSession, newDay)
 [onH, onL] = f_sessHiLo(i_onSession, newDay)
 
-// Previous-day H/L/C via non-look-ahead security on daily tf.
 pdH = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_off)
 pdL = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_off)
 pdC = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off)
 
-// Confirmed swing pivots (lagged => no look-ahead). Hold last confirmed value.
 phRaw = ta.pivothigh(high, i_pivLen, i_pivLen)
 plRaw = ta.pivotlow(low,  i_pivLen, i_pivLen)
 var float lastPH = na
@@ -266,7 +286,6 @@ if not na(phRaw)
 if not na(plRaw)
     lastPL := plRaw
 
-// Nearest opposing level above / below current price (for room-to-travel).
 f_nearestAbove(float px) =>
     float best = na
     if i_usePM and not na(pmH) and pmH > px
@@ -304,277 +323,294 @@ f_nearestBelow(float px) =>
     best
 
 // =============================================================================
-// SECTION 5 : FEATURE ENGINEERING
-// Each feature is normalized. Signed features in [-1,1] (+ bullish, - bearish);
-// magnitude features in [0,1]. These are HEURISTIC evidence, not probabilities.
+// SECTION 5 : FEATURE ENGINEERING  (normalized; evidence, NOT probability)
+// Each signed feature in [-1,1] (+bull/-bear); magnitude features in [0,1].
+// To limit DOUBLE-COUNTING, correlated momentum/candle cues are COMBINED inside
+// their group rather than added as independent weighted terms downstream.
 // =============================================================================
-// Width used for normalization (ORB width, falling back to ATR).
 normW = (not na(orbWidth) and orbWidth > 0) ? orbWidth : atr
 tol   = i_touchTol * (na(orbWidth) ? atr : orbWidth)
 
-// ---- Feature Group 1 : ORB Boundary Pressure --------------------------------
-distToHigh = orbReady ? f_safeDiv(orbHigh - close, normW, na) : na   // >0 below high
-distToLow  = orbReady ? f_safeDiv(close - orbLow,  normW, na) : na   // >0 above low
+// ---- FG1 : ORB boundary pressure --------------------------------------------
+distToHigh = orbValid ? f_safeDiv(orbHigh - close, normW, na) : na
+distToLow  = orbValid ? f_safeDiv(close - orbLow,  normW, na) : na
 
-// Boundary tests over lookback: a "test" = bar high/low within tol of boundary.
-touchHigh = orbReady and (high >= orbHigh - tol) and (high <= orbHigh + tol) and close < orbHigh
-touchLow  = orbReady and (low  <= orbLow  + tol) and (low  >= orbLow  - tol) and close > orbLow
-// Rolling count within lookback window. math.sum is called every bar (outside
-// any ternary) for consistent series state, then gated on orbReady afterwards.
+touchHigh = orbValid and (high >= orbHigh - tol) and (high <= orbHigh + tol) and close < orbHigh
+touchLow  = orbValid and (low  <= orbLow  + tol) and (low  >= orbLow  - tol) and close > orbLow
 testsHighRaw = math.sum(touchHigh ? 1.0 : 0.0, i_testLook)
 testsLowRaw  = math.sum(touchLow  ? 1.0 : 0.0, i_testLook)
-testsHigh = orbReady ? testsHighRaw : 0.0
-testsLow  = orbReady ? testsLowRaw  : 0.0
+testsHigh = orbValid ? testsHighRaw : 0.0
+testsLow  = orbValid ? testsLowRaw  : 0.0
 
-// Rejection strength after a test = how far price pulled back from the boundary.
 rejHigh = touchHigh ? f_safeDiv(orbHigh - close, normW, 0.0) : 0.0
 rejLow  = touchLow  ? f_safeDiv(close - orbLow,  normW, 0.0) : 0.0
+avgRejHigh = ta.sma(rejHigh, i_testLook)
+avgRejLow  = ta.sma(rejLow,  i_testLook)
 
-// Higher-low near upper boundary / lower-high near lower boundary (structure).
-nearHigh = orbReady and not na(distToHigh) and distToHigh < i_touchTol * 2
-nearLow  = orbReady and not na(distToLow)  and distToLow  < i_touchTol * 2
-higherLow  = low  > low[1]  and low[1]  > low[2]
-lowerHigh  = high < high[1] and high[1] < high[2]
+nearHigh = orbValid and not na(distToHigh) and distToHigh < i_touchTol * 2
+nearLow  = orbValid and not na(distToLow)  and distToLow  < i_touchTol * 2
+higherLow = low  > low[1]  and low[1]  > low[2]
+lowerHigh = high < high[1] and high[1] < high[2]
 
-// Persistent pressure vs repeated rejection:
-//   persistentUp  = many touches of HIGH with SHALLOW rejection + higher lows.
-//   rejectionUp   = many touches of HIGH with DEEP rejection (bearish for break).
-avgRejHigh   = ta.sma(rejHigh, i_testLook)
-avgRejLow    = ta.sma(rejLow,  i_testLook)
-
-// Signed pressure score: positive => pressure toward UP break.
+// Persistent pressure (shallow rejection + supportive structure) vs repeated
+// rejection (deep rejection => bearish for an UP break, and vice-versa).
 pressUp = (testsHigh > 0 ? f_clamp(testsHigh / 5.0, 0, 1) : 0.0) * (1.0 - f_clamp(avgRejHigh * 4.0, 0, 1)) + (nearHigh and higherLow ? 0.4 : 0.0)
 pressDn = (testsLow  > 0 ? f_clamp(testsLow  / 5.0, 0, 1) : 0.0) * (1.0 - f_clamp(avgRejLow  * 4.0, 0, 1)) + (nearLow and lowerHigh ? 0.4 : 0.0)
-fgPressure = f_clamp(pressUp - pressDn, -1, 1)                        // signed
+fgPressure = f_clamp(pressUp - pressDn, -1, 1)
 
-// ---- Feature Group 2 : Candle Price Action ----------------------------------
+// ---- FG2 : candle anatomy ---------------------------------------------------
 rng      = high - low
 body     = close - open
 bodyAbs  = math.abs(body)
-bodyPct  = f_safeDiv(bodyAbs, rng, 0.0)                               // [0,1]
+bodyPct  = f_safeDiv(bodyAbs, rng, 0.0)
 upWick   = high - math.max(close, open)
 dnWick   = math.min(close, open) - low
 upWickP  = f_safeDiv(upWick, rng, 0.0)
 dnWickP  = f_safeDiv(dnWick, rng, 0.0)
-closeLoc = f_safeDiv(close - low, rng, 0.5) * 2.0 - 1.0               // [-1,1] bottom..top
+closeLoc = f_safeDiv(close - low, rng, 0.5) * 2.0 - 1.0
 
-// Consecutive directional closes.
 bull = close > open
 bear = close < open
 var int consec = 0
 consec := bull ? (consec >= 0 ? consec + 1 : 1) : bear ? (consec <= 0 ? consec - 1 : -1) : 0
 consecN = f_clamp(consec / 4.0, -1, 1)
 
-// Body expansion (displacement vs recent average).
 bodyExp = f_clamp(f_safeDiv(bodyAbs - ta.sma(bodyAbs, 10), ta.sma(bodyAbs, 10), 0.0), -1, 1)
-
-// Weakening opposing wicks: bearish (upper) wicks shrinking during up-move, etc.
 upWickFall = upWickP < upWickP[1] and upWickP[1] < upWickP[2]
 dnWickFall = dnWickP < dnWickP[1] and dnWickP[1] < dnWickP[2]
 wickSignal = (bull and upWickFall ? 0.5 : 0.0) - (bear and dnWickFall ? 0.5 : 0.0)
-
-// Signed candle score.
 fgCandle = f_clamp((closeLoc * bodyPct) * 0.6 + consecN * 0.3 + bodyExp * (bull ? 0.2 : -0.2) + wickSignal * 0.3, -1, 1)
 
-// ---- Feature Group 3 : Momentum & Volatility --------------------------------
-roc        = f_safeDiv(close - close[horizonBars], normW, 0.0)        // rate of change over horizon
+// ---- FG3 : momentum & volatility --------------------------------------------
+roc        = f_safeDiv(close - close[horizonBars], normW, 0.0)
 mom        = f_clamp(roc, -1, 1)
 momAccel   = f_clamp((roc - f_safeDiv(close[1] - close[horizonBars+1], normW, 0.0)) * 2.0, -1, 1)
 rangeSma   = ta.sma(rng, 10)
-compression = f_clamp(1.0 - f_safeDiv(rng, rangeSma, 1.0), -1, 1)     // >0 => compressing
-volExpand  = f_clamp(atrChg * 3.0, -1, 1)                            // >0 => expanding vol
-fgMomentum = f_clamp(mom * 0.6 + momAccel * 0.4, -1, 1)              // signed
-
-// "Escape energy": compression + expansion favors a break; exhaustion does not.
-// Distinguish compression-before-break (energy+) vs exhaustion (energy-).
+compression = f_clamp(1.0 - f_safeDiv(rng, rangeSma, 1.0), -1, 1)   // >0 compressing
+volExpand  = f_clamp(atrChg * 3.0, -1, 1)
+fgMomentum = f_clamp(mom * 0.6 + momAccel * 0.4, -1, 1)
+// Three regimes: compression (energy+), healthy expansion (energy+), exhaustion (energy-).
 exhaustion = (math.abs(mom) > 0.6 and volExpand < -0.2) ? 0.5 : 0.0
 energy = f_clamp(0.35 + math.max(0.0, volExpand) * 0.4 + math.max(0.0, compression) * 0.25 + math.abs(fgMomentum) * 0.3 - exhaustion, 0.0, 1.0)
 
-// ---- Feature Group 4 : Relative Volume --------------------------------------
-rvScore = volOk ? f_clamp((relVol - 1.0), -1, 1) : 0.0               // magnitude-ish
-// Directional volume tilt: volume on up candles vs down candles (recent).
+// ---- FG4 : relative volume --------------------------------------------------
+rvScore = volOk ? f_clamp((relVol - 1.0), -1, 1) : 0.0
 upVol   = ta.sma(bull and volOk ? volume : 0.0, 10)
 dnVol   = ta.sma(bear and volOk ? volume : 0.0, 10)
 volTilt = volOk ? f_clamp(f_safeDiv(upVol - dnVol, upVol + dnVol, 0.0), -1, 1) : 0.0
 
-// ---- Feature Group 5 : VWAP & Market Structure ------------------------------
+// ---- FG5 : VWAP & structure -------------------------------------------------
 vwapDist   = f_safeDiv(close - vwapVal, normW, 0.0)
 vwapSide   = f_clamp(vwapDist * 1.5, -1, 1)
 vwapSlopeN = f_clamp(f_safeDiv(vwapSlope, normW, 0.0) * 3.0, -1, 1)
-// Repeated VWAP crossings => choppy environment (reduces edge, not directional).
 vwapCross  = (close > vwapVal) != (close[1] > vwapVal)
-vwapCrossN = math.sum(vwapCross ? 1 : 0, 20)
-choppy     = f_clamp(vwapCrossN / 6.0, 0, 1)
-// Structure: HH/HL vs LH/LL using confirmed pivots.
+vwapCrossN = math.sum(vwapCross ? 1.0 : 0.0, 20)
+// Chop needs corroboration: many VWAP crossings AND weak directional push.
+overlap    = f_clamp(1.0 - f_safeDiv(bodyAbs, rng, 0.0), 0, 1)
+avgOverlap = ta.sma(overlap, 10)
+choppy     = f_clamp((vwapCrossN / i_chopCross) * 0.6 + avgOverlap * 0.4, 0, 1)
 structUp   = not na(lastPH) and not na(lastPL) and close > lastPH
 structDn   = not na(lastPH) and not na(lastPL) and close < lastPL
 fgVwap = f_clamp((vwapSide * 0.5 + vwapSlopeN * 0.3 + (structUp ? 0.3 : 0.0) - (structDn ? 0.3 : 0.0)) * (1.0 - choppy * 0.5), -1, 1)
 
-// ---- Feature Group 6 : Liquidity / room-to-travel ---------------------------
+// ---- FG6 : room-to-travel ---------------------------------------------------
 naAbove = f_nearestAbove(close)
 naBelow = f_nearestBelow(close)
-roomUp   = na(naAbove) ? 1.0 : f_clamp(f_safeDiv(naAbove - orbHigh, normW, 1.0), 0, 2) / 2.0
-roomDn   = na(naBelow) ? 1.0 : f_clamp(f_safeDiv(orbLow - naBelow, normW, 1.0), 0, 2) / 2.0
-fgLevels = f_clamp(roomUp - roomDn, -1, 1)                           // more room up => +
+roomUp  = na(naAbove) or na(orbHigh) ? 1.0 : f_clamp(f_safeDiv(naAbove - orbHigh, normW, 1.0), 0, 2) / 2.0
+roomDn  = na(naBelow) or na(orbLow)  ? 1.0 : f_clamp(f_safeDiv(orbLow - naBelow, normW, 1.0), 0, 2) / 2.0
+fgLevels = f_clamp(roomUp - roomDn, -1, 1)
 
-// ---- Feature Group 7 : Session conditions -----------------------------------
+// ---- FG7 : session conditions ----------------------------------------------
 inNewsBlackout = i_newsOn and not na(time(timeframe.period, i_newsSess, i_tz))
 
 // =============================================================================
-// SECTION 6 : STAGE A -- PRE-BREAKOUT PROBABILITY MODEL
-// Net directional evidence D in ~[-W,W]; map to UP vs DOWN via logistic.
-// Break "energy" E in [0,1] => P(some break). First-passage simplex:
-//   P(UP_FIRST)=E*pUp ; P(DOWN_FIRST)=E*pDn ; P(NEITHER)=1-E.  (sum=100%)
-// Time-remaining in horizon scales E (less time left => lower P(break)).
+// SECTION 6 : STAGE A — PRE-BREAKOUT PROBABILITY MODEL
+// D = weighted net directional evidence; pUp = sigmoid(k*D). "Energy" E in [0,1]
+// => P(any break). Simplex: P(UP)=E*pUp, P(DOWN)=E*pDn, P(NONE)=1-E (sum=100%).
+// E is scaled by horizon time remaining. On chop or weak energy => NO EDGE.
 // =============================================================================
 D = w_pressure * fgPressure + w_candle * fgCandle + w_momentum * fgMomentum + w_vwap * fgVwap + w_levels * fgLevels + 0.4 * volTilt
 D := f_clamp(D, -3.0, 3.0)
-
-pUpRaw = f_sigmoid(i_logisticK * D / 3.0)       // normalize D by max weight-ish
+pUpRaw = f_sigmoid(i_logisticK * D / 3.0)
 pDnRaw = 1.0 - pUpRaw
 
-// Energy scaled by remaining horizon fraction (more time => more chance to break)
-timeLeftFrac = orbReady ? f_clamp(1.0 - f_safeDiv(barsSinceORB, horizonBars, 0.0), 0, 1) : 1.0
-E = f_clamp(energy * (0.4 + 0.6 * timeLeftFrac) + rvScore * 0.1, 0.0, 0.98)
+timeLeftFrac = orbValid ? f_clamp(1.0 - f_safeDiv(barsSinceORB, horizonBars, 0.0), 0, 1) : 1.0
+E = f_clamp(energy * (0.4 + 0.6 * timeLeftFrac) * (1.0 - choppy * 0.4) + rvScore * 0.1, 0.0, 0.98)
 
-// Heuristic "any breakout" score (0..100) BEFORE calibration. The directional
-// split is applied via pUpRaw/pDnRaw below.
-hBreakAny  = 100.0 * E
+hBreakAny = 100.0 * E                               // uncalibrated "any break" score
+calBreak  = applyCal ? f_calibrate(hBreakAny) : hBreakAny
 
-// Apply calibration map to the "breakout any" score; keep directional split,
-// then renormalize so the three outcomes sum to 100%.
-calBreak = isCalibrated ? f_calibrate(hBreakAny) : hBreakAny
-pNeither = f_clamp(100.0 - calBreak, 0, 100)
-pUpFirst = f_clamp(calBreak * pUpRaw, 0, 100)
-pDnFirst = f_clamp(calBreak * pDnRaw, 0, 100)
-// Renormalize for safety.
-pSum = pUpFirst + pDnFirst + pNeither
-// Renormalize so the simplex sums to exactly 100%. If pSum ever degenerates to
-// 0 (should be impossible given E<=0.98), fall back to the honest "no edge"
-// outcome P(NEITHER)=100 rather than silently producing 0/0/0.
-if pSum > 0.0
-    pUpFirst := pUpFirst / pSum * 100.0
-    pDnFirst := pDnFirst / pSum * 100.0
-    pNeither := pNeither / pSum * 100.0
+// Build the rolling simplex.
+pNone0 = f_clamp(100.0 - calBreak, 0, 100)
+pUp0   = f_clamp(calBreak * pUpRaw, 0, 100)
+pDn0   = f_clamp(calBreak * pDnRaw, 0, 100)
+pSum0  = pUp0 + pDn0 + pNone0
+float pUpRoll = na
+float pDnRoll = na
+float pNoneRoll = na
+if pSum0 > 0.0
+    pUpRoll   := pUp0  / pSum0 * 100.0
+    pDnRoll   := pDn0  / pSum0 * 100.0
+    pNoneRoll := pNone0 / pSum0 * 100.0
 else
-    pUpFirst := 0.0
-    pDnFirst := 0.0
-    pNeither := 100.0
-pBreakAny = 100.0 - pNeither
+    pUpRoll   := 0.0
+    pDnRoll   := 0.0
+    pNoneRoll := 100.0
+
+// Directional evidence (separate from event probability), -100..100.
+dirEvidence = f_clamp(D / 3.0, -1, 1) * 100.0
+
+// ---- Snapshot mode: freeze the estimate at ORB completion -------------------
+var float pUpSnap   = na
+var float pDnSnap   = na
+var float pNoneSnap = na
+var float dirSnap   = na
+if orbEnded and orbValid
+    pUpSnap   := pUpRoll
+    pDnSnap   := pDnRoll
+    pNoneSnap := pNoneRoll
+    dirSnap   := dirEvidence
+
+// Active outputs depend on mode.
+pUpFirst  = rollingMode ? pUpRoll   : pUpSnap
+pDnFirst  = rollingMode ? pDnRoll   : pDnSnap
+pNoBreak  = rollingMode ? pNoneRoll : pNoneSnap
+dirShown  = rollingMode ? dirEvidence : dirSnap
+pBreakAny = na(pNoBreak) ? na : 100.0 - pNoBreak
 
 // =============================================================================
-// SECTION 7 : BREAKOUT DETECTION (confirmed close beyond ORB -- non-repainting)
+// SECTION 7 : BREAKOUT DETECTION  (confirmed close beyond ORB; non-repainting)
 // =============================================================================
 confBar = i_intrabar ? true : barstate.isconfirmed
-closeAboveHigh = orbReady and confBar and close > orbHigh
-closeBelowLow  = orbReady and confBar and close < orbLow
+closeAboveHigh = orbValid and confBar and close > orbHigh
+closeBelowLow  = orbValid and confBar and close < orbLow
 
-// Register the FIRST confirmed breakout within session.
-if orbReady and not inNewsBlackout
-    if firstBreakDir == 0 and closeAboveHigh
+// Only register a FIRST break while still WITHIN the horizon. A first confirmed
+// close beyond a boundary that lands AFTER the horizon is, by definition, a
+// NO-BREAKOUT outcome for this forecast and must not be labeled directional.
+inBreakWindow = orbValid and not na(barsSinceORB) and barsSinceORB >= 1 and barsSinceORB <= horizonBars
+if inBreakWindow and isOneMin and not inNewsBlackout and firstBreakDir == 0
+    // Ambiguous: a single confirmed candle closes beyond BOTH boundaries.
+    if closeAboveHigh and closeBelowLow
+        firstBreakDir := 2
+        breakBar      := bar_index
+        breakAtr      := atr
+        postOutcome   := 8
+    else if closeAboveHigh
         firstBreakDir := 1
         breakBar      := bar_index
-    else if firstBreakDir == 0 and closeBelowLow
+        breakAtr      := atr
+    else if closeBelowLow
         firstBreakDir := -1
         breakBar      := bar_index
+        breakAtr      := atr
 
-brokeOut   = firstBreakDir != 0
+brokeOut   = firstBreakDir == 1 or firstBreakDir == -1
+ambiguous  = firstBreakDir == 2
 barsSinceBreak = brokeOut ? (bar_index - breakBar) : na
 
 // =============================================================================
-// SECTION 8 : STAGE B -- POST-BREAKOUT CONTINUATION & FAILURE MODELS
+// SECTION 8 : STAGE B — POST-BREAKOUT MODEL (own labels; cont/fail/unresolved)
 // =============================================================================
-// Breakout candle (the confirmed break bar) quality -- captured at break.
-var float brkBodyPct   = na
-var float brkRelVol    = na
-if (closeAboveHigh or closeBelowLow) and firstBreakDir != 0 and barsSinceBreak == 0
-    brkBodyPct  := bodyPct
-    brkRelVol   := volOk ? relVol : na
+var float brkBodyPct = na
+var float brkRelVol  = na
+if brokeOut and barsSinceBreak == 0
+    brkBodyPct := bodyPct
+    brkRelVol  := volOk ? relVol : na
 
-// Displacement beyond the range (in ORB widths) since break.
-displace = brokeOut ? (firstBreakDir == 1 ? f_safeDiv(close - orbHigh, normW, 0.0) : f_safeDiv(orbLow - close, normW, 0.0)) : na
+// Continuation TARGET and FAILURE condition (configurable, documented).
+contTarget = brokeOut ? (firstBreakDir == 1 ? orbHigh + i_contATR * breakAtr : orbLow - i_contATR * breakAtr) : na
+displace   = brokeOut ? (firstBreakDir == 1 ? f_safeDiv(close - orbHigh, normW, 0.0) : f_safeDiv(orbLow - close, normW, 0.0)) : na
 
-// Follow-through: count of candles continuing the break direction after break.
-contBar = brokeOut and barsSinceBreak > 0 and barsSinceBreak <= i_followN and (firstBreakDir == 1 ? close > close[1] : close < close[1])
-// math.sum called every bar (outside the ternary) for consistent series state.
-followCountRaw = math.sum(contBar ? 1.0 : 0.0, i_followN)
+// Continuation requires sustained movement: evaluated from the bar AFTER the
+// break (barsSinceBreak >= 1), so an explosive break bar alone cannot resolve it.
+reachedTarget = brokeOut and confBar and barsSinceBreak >= 1 and (firstBreakDir == 1 ? high >= contTarget : low <= contTarget)
+backInsideClose = brokeOut and confBar and close < orbHigh and close > orbLow
+backInsideTouch = brokeOut and confBar and (firstBreakDir == 1 ? low < orbHigh : high > orbLow)
+failTrigger = i_failInside ? backInsideClose : backInsideTouch
+
+// Resolve the post-breakout outcome ONCE, on confirmed bars, within horizon.
+if brokeOut and postOutcome == 0 and confBar
+    if reachedTarget and not failTrigger
+        postOutcome := 1
+        continued   := true
+    else if failTrigger and not reachedTarget
+        postOutcome := -1
+        failedBreak := true
+    else if reachedTarget and failTrigger
+        postOutcome := 8          // ambiguous same-bar; excluded from calibration
+    else if barsSinceBreak >= postHorzBars
+        postOutcome := 9          // UNRESOLVED
+
+// Supporting continuation/failure EVIDENCE (uncalibrated scores).
+contBar = brokeOut and barsSinceBreak > 0 and barsSinceBreak <= postHorzBars and (firstBreakDir == 1 ? close > close[1] : close < close[1])
+followCountRaw = math.sum(contBar ? 1.0 : 0.0, postHorzBars)
 followCount = brokeOut ? followCountRaw : na
-
-// VWAP alignment with the break direction.
 vwapAlign = brokeOut ? (firstBreakDir == 1 ? (close > vwapVal and vwapSlope > 0) : (close < vwapVal and vwapSlope < 0)) : false
-
-// Rejection wick against the break on the current bar.
 rejWickAgainst = brokeOut ? (firstBreakDir == 1 ? upWickP : dnWickP) : na
-
-// Room-to-travel in break direction.
 roomDir = brokeOut ? (firstBreakDir == 1 ? roomUp : roomDn) : na
 
-// Close back inside the ORB after breaking (failure trigger).
-backInside = brokeOut and confBar and close < orbHigh and close > orbLow
-
-// Retest: price returns to the broken boundary then holds in break direction.
 retestTouch = brokeOut and not retestDone and (firstBreakDir == 1 ? (low <= orbHigh + tol and low >= orbHigh - tol) : (high >= orbLow - tol and high <= orbLow + tol))
 retestHold  = retestTouch and (firstBreakDir == 1 ? close > orbHigh : close < orbLow)
 if retestHold
     retestDone := true
 
-// ---- Continuation score (0..100, heuristic) ---------------------------------
-contScore = brokeOut ? f_clamp( 100.0 * (
+contScore = brokeOut ? f_clamp(100.0 * (
       0.22 * f_clamp(na(brkBodyPct) ? 0.0 : brkBodyPct, 0, 1)
     + 0.18 * f_clamp(na(displace) ? 0.0 : displace, 0, 1.5) / 1.5
-    + 0.15 * f_clamp(na(followCount) ? 0.0 : followCount / math.max(1, i_followN), 0, 1)
+    + 0.15 * f_clamp(na(followCount) ? 0.0 : followCount / math.max(1, postHorzBars), 0, 1)
     + 0.12 * (volOk and not na(brkRelVol) ? f_clamp((brkRelVol - 1.0), 0, 1) : 0.0)
     + 0.13 * (vwapAlign ? 1.0 : 0.0)
     + 0.10 * f_clamp(na(roomDir) ? 0.5 : roomDir, 0, 1)
     + 0.10 * (retestDone ? 1.0 : 0.0)
     ), 0, 100) : na
 
-// ---- Failure risk (0..100, heuristic) ---------------------------------------
-failScore = brokeOut ? f_clamp( 100.0 * (
-      0.30 * (backInside ? 1.0 : 0.0)
+failScore = brokeOut ? f_clamp(100.0 * (
+      0.30 * (backInsideClose ? 1.0 : 0.0)
     + 0.20 * f_clamp(na(rejWickAgainst) ? 0.0 : rejWickAgainst, 0, 1)
     + 0.15 * (volOk and not na(brkRelVol) ? f_clamp((1.0 - brkRelVol), 0, 1) : 0.3)
-    + 0.15 * (na(followCount) or followCount == 0 ? 1.0 : f_clamp(1.0 - followCount / math.max(1, i_followN), 0, 1))
+    + 0.15 * (na(followCount) or followCount == 0 ? 1.0 : f_clamp(1.0 - followCount / math.max(1, postHorzBars), 0, 1))
     + 0.10 * (vwapAlign ? 0.0 : 1.0)
     + 0.10 * f_clamp(1.0 - (na(roomDir) ? 0.5 : roomDir), 0, 1)
     ), 0, 100) : na
 
-calCont = (not na(contScore) and isCalibrated) ? f_calibrate(contScore) : contScore
-calFail = (not na(failScore) and isCalibrated) ? f_calibrate(failScore) : failScore
-
-// Failure confirmed when price closes back inside after a break.
-if brokeOut and backInside and barsSinceBreak > 0
-    failedBreak := true
+calCont = (not na(contScore) and applyCal) ? f_calibrate(contScore) : contScore
+calFail = (not na(failScore) and applyCal) ? f_calibrate(failScore) : failScore
 
 // =============================================================================
-// SECTION 9 : STATE MACHINE (anti-flicker via min-dwell)
+// SECTION 9 : MARKET STATE MACHINE
+// 0 none,1 FORMING,2 PRE-BREAKOUT,3 BREAKOUT CONFIRMED,4 CONTINUATION,
+// 5 FAILED,6 RANGE/NO EDGE,7 INSUFFICIENT DATA
 // =============================================================================
-// States: 0 NONE,1 ORB FORMING,2 PRE-BREAKOUT,3 BREAKOUT CONFIRMED,
-//         4 CONTINUATION DEVELOPING,5 FAILED BREAKOUT,6 RANGE/NO EDGE
-f_stateName(int s) =>
-    s == 1 ? "ORB FORMING" : s == 2 ? "PRE-BREAKOUT" : s == 3 ? "BREAKOUT CONFIRMED" : s == 4 ? "CONTINUATION DEVELOPING" : s == 5 ? "FAILED BREAKOUT" : s == 6 ? "RANGE / NO EDGE" : "—"
+f_stateName(int s) => s==1?"ORB FORMING":s==2?"PRE-BREAKOUT":s==3?"BREAKOUT CONFIRMED":s==4?"CONTINUATION DEVELOPING":s==5?"FAILED BREAKOUT":s==6?"RANGE / NO EDGE":s==7?"INSUFFICIENT DATA":"—"
+
+insufficient = (not isOneMin) or (orbReady and not orbValid) or (barstate.isfirst) or (bar_index < rthBarsPerDay)
 
 rawState = 0
-if inORB
+if insufficient
+    rawState := 7
+else if inORB
     rawState := 1
-else if orbReady and not brokeOut and withinHorizon
-    rawState := (choppy > 0.6 or pBreakAny < 35) ? 6 : 2
-else if orbReady and not brokeOut and not withinHorizon
+else if ambiguous
     rawState := 6
-else if brokeOut and failedBreak
+else if orbValid and not brokeOut and withinHorizon
+    rawState := (choppy > 0.6 or na(pBreakAny) or pBreakAny < 35) ? 6 : 2
+else if orbValid and not brokeOut and not withinHorizon
+    rawState := 6
+else if brokeOut and postOutcome == -1
     rawState := 5
-else if brokeOut and not na(calCont) and calCont >= i_contThr and not failedBreak
+else if brokeOut and postOutcome == 1
+    rawState := 4
+else if brokeOut and not na(calCont) and calCont >= i_contThr
     rawState := 4
 else if brokeOut
     rawState := 3
 
-// Transitions into event-critical states commit IMMEDIATELY (no dwell), so a
-// confirmed breakout or a fast failure is never hidden behind the anti-flicker
-// delay. The dwell only smooths the "soft" states (pre-breakout / range / mid).
-immediate = rawState == 3 or rawState == 4 or rawState == 5
-var int   state      = 0
-var int   pendState  = 0
-var int   pendCount  = 0
+// Event-critical states commit immediately; soft states respect min-dwell.
+immediate = rawState == 3 or rawState == 4 or rawState == 5 or rawState == 7
+var int state     = 0
+var int pendState = 0
+var int pendCount = 0
 if confBar
     if rawState == state
         pendState := state
@@ -594,32 +630,17 @@ if confBar
 stateStr = f_stateName(state)
 
 // =============================================================================
-// SECTION 10 : VISUALIZATION
-// -----------------------------------------------------------------------------
-// ORB high/low/mid are drawn with line.new (anchored to real bar/price
-// coordinates) rather than plot(...style_linebr), so the levels stay pinned to
-// the chart and extend cleanly across the session when panning/zooming. Each
-// new session starts fresh lines; the previous session's lines are left in
-// place as history.
+// SECTION 10 : VISUALIZATION  (anchored line.new so levels never float)
 // =============================================================================
-// Persistent handles for the CURRENT session's ORB lines. They are created when
-// the range completes and their right edge (x2) is pushed to the current bar on
-// every subsequent bar of the session, so they draw as one continuous, anchored
-// horizontal level that tracks correctly on pan/zoom. A new session makes new
-// lines; previous sessions' lines remain as history.
 var line lnHigh = na
 var line lnMid  = na
 var line lnLow  = na
-
 if i_showORB
-    // Create fresh lines the moment the ORB completes (anchored at this bar).
-    if orbEnded
-        lnHigh := line.new(bar_index, orbHigh, bar_index + 1, orbHigh, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.teal, 0), width=2)
-        lnLow  := line.new(bar_index, orbLow,  bar_index + 1, orbLow,  xloc=xloc.bar_index, extend=extend.none, color=color.new(color.maroon, 0), width=2)
-        lnMid  := i_showMid ? line.new(bar_index, orbMid, bar_index + 1, orbMid, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.gray, 40), width=1, style=line.style_dotted) : na
-    // Keep the levels pinned to the current price and push the right edge out
-    // every bar from the ORB completion through the end of the RTH session.
-    if orbReady and inRTH and not na(lnHigh)
+    if orbEnded and orbValid
+        lnHigh := line.new(orbEndBar, orbHigh, bar_index, orbHigh, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.teal, 0), width=2)
+        lnLow  := line.new(orbEndBar, orbLow,  bar_index, orbLow,  xloc=xloc.bar_index, extend=extend.none, color=color.new(color.maroon, 0), width=2)
+        lnMid  := i_showMid ? line.new(orbEndBar, orbMid, bar_index, orbMid, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.gray, 40), width=1, style=line.style_dotted) : na
+    if orbValid and inRTH and not na(lnHigh)
         line.set_xy1(lnHigh, orbEndBar, orbHigh)
         line.set_xy2(lnHigh, bar_index, orbHigh)
         line.set_xy1(lnLow,  orbEndBar, orbLow)
@@ -629,83 +650,119 @@ if i_showORB
             line.set_xy2(lnMid, bar_index, orbMid)
 
 plot(i_showVWAP and inRTH ? vwapVal : na, "VWAP", color=color.new(color.blue, 0), linewidth=1, style=plot.style_linebr)
-
-// Reference levels.
 plot(i_showLvls and i_usePM ? pmH : na, "PM High", color=color.new(color.orange, 50), style=plot.style_circles)
 plot(i_showLvls and i_usePM ? pmL : na, "PM Low",  color=color.new(color.orange, 50), style=plot.style_circles)
 plot(i_showLvls and i_usePD ? pdH : na, "PD High", color=color.new(color.purple, 50), style=plot.style_circles)
 plot(i_showLvls and i_usePD ? pdL : na, "PD Low",  color=color.new(color.purple, 50), style=plot.style_circles)
 
-// Markers (small, non-cluttering, confirmed only).
 breakUpMark = i_showMarks and closeAboveHigh and firstBreakDir == 1 and barsSinceBreak == 0
 breakDnMark = i_showMarks and closeBelowLow  and firstBreakDir == -1 and barsSinceBreak == 0
 plotshape(breakUpMark, "Breakout Up",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
 plotshape(breakDnMark, "Breakout Down", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),   size=size.tiny)
-// Failed-breakout markers: location must be a const, so split by direction.
-failMark   = i_showMarks and brokeOut and backInside and not failedBreak[1]
-failMarkUp = failMark and firstBreakDir == 1
-failMarkDn = failMark and firstBreakDir == -1
-plotshape(failMarkUp, "Failed Breakout (up)",   style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
-plotshape(failMarkDn, "Failed Breakout (down)", style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
-// Retest markers: likewise split by direction.
-retestMark   = i_showRetest and retestHold and not retestDone[1]
-retestMarkUp = retestMark and firstBreakDir == 1
-retestMarkDn = retestMark and firstBreakDir == -1
-plotshape(retestMarkUp, "Retest (up)",   style=shape.circle, location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny)
-plotshape(retestMarkDn, "Retest (down)", style=shape.circle, location=location.abovebar, color=color.new(color.blue, 0), size=size.tiny)
+
+failNow = i_showMarks and brokeOut and postOutcome == -1 and postOutcome[1] != -1
+plotshape(failNow and firstBreakDir == 1,  "Failed (up)",   style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(failNow and firstBreakDir == -1, "Failed (down)", style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
+
+retestNow = i_showRetest and retestHold and not retestDone[1]
+plotshape(retestNow and firstBreakDir == 1,  "Retest (up)",   style=shape.circle, location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny)
+plotshape(retestNow and firstBreakDir == -1, "Retest (down)", style=shape.circle, location=location.abovebar, color=color.new(color.blue, 0), size=size.tiny)
 
 // =============================================================================
-// SECTION 11 : DASHBOARD
+// SECTION 11 : RESEARCH EXPORT (for external calibration — see README Phase 5)
+// Realized outcome code resolved AFTER horizon: 1 up-first, -1 down-first,
+// 0 no-break, 8 ambiguous. Plotted only when resolved so each forecast row maps
+// to a realized label when you "Export chart data".
+// =============================================================================
+// preOutcome codes: 1 up-first, -1 down-first, 5 NO-BREAKOUT(resolved), 8 ambiguous.
+// (We use 5 for an explicitly-resolved NO-BREAKOUT so it is distinguishable from
+// the still-open sentinel 0.) Resolution latches once and never un-resolves.
+var int preOutcome = 0
+if orbValid and preOutcome == 0 and isOneMin
+    if ambiguous
+        preOutcome := 8
+    else if firstBreakDir == 1
+        preOutcome := 1
+    else if firstBreakDir == -1
+        preOutcome := -1
+    else if not na(barsSinceORB) and barsSinceORB >= horizonBars + 1
+        preOutcome := 5           // horizon elapsed with no in-window break
+preResolved = preOutcome != 0
+// Export emits the NO-BREAKOUT code as 0 (its natural label) but uses the
+// internal 5 sentinel to know it is resolved.
+preOutcomeExport = preOutcome == 5 ? 0 : preOutcome
+
+plot(i_export ? pUpFirst   : na, "EXP_pUp",       display=display.data_window)
+plot(i_export ? pDnFirst   : na, "EXP_pDn",       display=display.data_window)
+plot(i_export ? pNoBreak   : na, "EXP_pNone",     display=display.data_window)
+plot(i_export ? dirShown   : na, "EXP_dirEv",     display=display.data_window)
+plot(i_export ? contScore  : na, "EXP_contScore", display=display.data_window)
+plot(i_export ? failScore  : na, "EXP_failScore", display=display.data_window)
+plot(i_export ? (preResolved ? preOutcomeExport : na)  : na, "EXP_preOutcome",  display=display.data_window)
+plot(i_export ? (postOutcome != 0 ? postOutcome : na) : na, "EXP_postOutcome", display=display.data_window)
+
+// =============================================================================
+// SECTION 12 : DASHBOARD
 // =============================================================================
 dashPos = i_dashPos == "Top Right" ? position.top_right : i_dashPos == "Bottom Right" ? position.bottom_right : i_dashPos == "Top Left" ? position.top_left : position.bottom_left
-
-f_pColor(float up, float dn) => up > dn + 5 ? color.new(color.green, 70) : dn > up + 5 ? color.new(color.red, 70) : color.new(color.gray, 70)
-f_riskColor(float v) => v >= i_failThr ? color.new(color.orange, 60) : v >= 40 ? color.new(color.yellow, 70) : color.new(color.gray, 75)
+f_pColor(float up, float dn) => na(up) or na(dn) ? color.new(color.gray, 75) : up > dn + 5 ? color.new(color.green, 70) : dn > up + 5 ? color.new(color.red, 70) : color.new(color.gray, 70)
+f_riskColor(float v) => na(v) ? color.new(color.gray, 80) : v >= i_failThr ? color.new(color.orange, 60) : v >= 40 ? color.new(color.yellow, 70) : color.new(color.gray, 75)
+f_pctStr(float v) => na(v) ? "—" : str.tostring(v, "#.0") + (calibrated ? "%" : "")
+f_scoreStr(float v) => na(v) ? "—" : str.tostring(v, "#.0") + (calibrated ? "%" : " (score)")
 
 var table dash = na
 if i_showDash and na(dash)
-    dash := table.new(dashPos, 2, 18, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+    dash := table.new(dashPos, 2, 20, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
 
-// Writes a key/value row at index r and returns the NEXT row index (r+1).
 f_row(int r, string k, string v, color bg) =>
     table.cell(dash, 0, r, k, text_size=size.small, text_color=color.new(color.white, 0), text_halign=text.align_left,  bgcolor=color.new(color.black, 20))
     table.cell(dash, 1, r, v, text_size=size.small, text_color=color.new(color.white, 0), text_halign=text.align_right, bgcolor=bg)
     r + 1
 
 if i_showDash and not na(dash) and barstate.islast
-    priceLoc = orbReady ? (close > orbHigh ? "ABOVE" : close < orbLow ? "BELOW" : "INSIDE") : "—"
-    calTag   = isCalibrated ? "CALIBRATED" : "UNCALIBRATED (heuristic)"
-    volTag   = not volOk ? "N/A (no volume)" : relVol >= 1.5 ? "HIGH" : relVol >= 1.0 ? "ABOVE AVG" : "LOW"
+    calTag = i_calStatus == "Uncalibrated" ? "UNCALIBRATED (heuristic)" : (not applyCal ? "UNCALIBRATED (map off/identity)" : (i_calStatus == "Calibrated - limited data" ? "CALIBRATED — LIMITED DATA" : "CALIBRATED — VALIDATED"))
+    calColor = calibrated ? color.new(color.green, 70) : color.new(color.yellow, 65)
+    priceLoc = orbValid ? (close > orbHigh ? "ABOVE" : close < orbLow ? "BELOW" : "INSIDE") : "—"
+    volTag  = not volOk ? "N/A (no volume)" : relVol >= 1.5 ? "HIGH" : relVol >= 1.0 ? "ABOVE AVG" : "LOW"
     volColor = not volOk ? color.new(color.gray, 70) : relVol >= 1.2 ? color.new(color.green, 70) : color.new(color.red, 70)
-    volCond  = volExpand > 0.2 ? "EXPANDING" : compression > 0.2 ? "COMPRESSING" : "NORMAL"
+    volCond = volExpand > 0.2 ? "EXPANDING" : compression > 0.2 ? "COMPRESSING" : "NORMAL"
     volCondC = volExpand > 0.2 ? color.new(color.green, 70) : compression > 0.2 ? color.new(color.yellow, 70) : color.new(color.gray, 75)
-    vwapTag  = close > vwapVal and vwapSlope > 0 ? "BULLISH" : close < vwapVal and vwapSlope < 0 ? "BEARISH" : "MIXED"
-    vwapC    = close > vwapVal and vwapSlope > 0 ? color.new(color.green, 70) : close < vwapVal and vwapSlope < 0 ? color.new(color.red, 70) : color.new(color.yellow, 70)
-    stateC   = state == 3 or state == 4 ? color.new(color.green, 60) : state == 5 ? color.new(color.orange, 55) : state == 6 ? color.new(color.gray, 70) : color.new(color.blue, 70)
+    vwapTag = close > vwapVal and vwapSlope > 0 ? "BULLISH" : close < vwapVal and vwapSlope < 0 ? "BEARISH" : "MIXED"
+    vwapC   = close > vwapVal and vwapSlope > 0 ? color.new(color.green, 70) : close < vwapVal and vwapSlope < 0 ? color.new(color.red, 70) : color.new(color.yellow, 70)
+    chopTag = choppy >= 0.6 ? "CHOPPY" : choppy >= 0.35 ? "MIXED" : "TRENDY/CLEAN"
+    chopC   = choppy >= 0.6 ? color.new(color.yellow, 65) : color.new(color.gray, 75)
+    dirTag  = na(dirShown) ? "—" : (dirShown > 10 ? "BULLISH " : dirShown < -10 ? "BEARISH " : "NEUTRAL ") + str.tostring(dirShown, "#")
+    dirC    = na(dirShown) ? color.new(color.gray, 75) : dirShown > 10 ? color.new(color.green, 70) : dirShown < -10 ? color.new(color.red, 70) : color.new(color.gray, 72)
+    stateC  = state==3 or state==4 ? color.new(color.green,60) : state==5 ? color.new(color.orange,55) : state==6 ? color.new(color.gray,70) : state==7 ? color.new(color.red,55) : color.new(color.blue,70)
 
-    table.cell(dash, 0, 0, "ORB BREAKOUT PROBABILITY", text_size=size.small, text_color=color.white, bgcolor=color.new(color.blue, 30))
-    table.cell(dash, 1, 0, syminfo.ticker + " · " + i_horizon, text_size=size.small, text_color=color.white, text_halign=text.align_right, bgcolor=color.new(color.blue, 30))
+    table.cell(dash, 0, 0, "ORB BREAKOUT FORECAST", text_size=size.small, text_color=color.white, bgcolor=color.new(color.blue, 30))
+    table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period + " · " + i_horizon, text_size=size.small, text_color=color.white, text_halign=text.align_right, bgcolor=color.new(color.blue, 30))
     int r = 1
+    if not isOneMin
+        r := f_row(r, "⚠ TIMEFRAME", "USE 1-MIN CHART", color.new(color.red, 40))
     r := f_row(r, "State", stateStr, stateC)
-    r := f_row(r, "Probabilities", calTag, isCalibrated ? color.new(color.green, 70) : color.new(color.yellow, 65))
+    r := f_row(r, "Mode", rollingMode ? "Rolling" : "Snapshot @09:35", color.new(color.black, 20))
+    r := f_row(r, "Calibration", calTag, calColor)
     if not i_minimal
-        r := f_row(r, "ORB High / Low", str.tostring(orbHigh, format.mintick) + " / " + str.tostring(orbLow, format.mintick), color.new(color.black, 20))
+        r := f_row(r, "ORB High / Low", orbValid ? str.tostring(orbHigh, format.mintick) + " / " + str.tostring(orbLow, format.mintick) : "—", color.new(color.black, 20))
         r := f_row(r, "ORB Width (pts)", na(orbWidth) ? "—" : str.tostring(orbWidth, format.mintick), color.new(color.black, 20))
         r := f_row(r, "Price location", priceLoc, color.new(color.black, 20))
-    r := f_row(r, "UP-first P", str.tostring(pUpFirst, "#.0") + "%", f_pColor(pUpFirst, pDnFirst))
-    r := f_row(r, "DOWN-first P", str.tostring(pDnFirst, "#.0") + "%", f_pColor(pDnFirst, pUpFirst))
-    r := f_row(r, "NEITHER (no break) P", str.tostring(pNeither, "#.0") + "%", color.new(color.gray, 70))
-    r := f_row(r, "Breakout likelihood", str.tostring(pBreakAny, "#.0") + "%", pBreakAny >= i_breakThr ? color.new(color.green, 60) : color.new(color.gray, 72))
-    r := f_row(r, "Continuation", na(calCont) ? "—" : str.tostring(calCont, "#.0") + (isCalibrated ? "%" : " (score)"), na(calCont) ? color.new(color.gray, 80) : (calCont >= i_contThr ? color.new(color.green, 60) : color.new(color.yellow, 70)))
-    r := f_row(r, "Failed-breakout risk", na(calFail) ? "—" : str.tostring(calFail, "#.0") + (isCalibrated ? "%" : " (score)"), na(calFail) ? color.new(color.gray, 80) : f_riskColor(calFail))
+    r := f_row(r, "Breakout potential", f_pctStr(pBreakAny), na(pBreakAny) ? color.new(color.gray,80) : (pBreakAny >= i_breakThr ? color.new(color.green,60) : color.new(color.gray,72)))
+    r := f_row(r, "Upside-first", f_pctStr(pUpFirst), f_pColor(pUpFirst, pDnFirst))
+    r := f_row(r, "Downside-first", f_pctStr(pDnFirst), f_pColor(pDnFirst, pUpFirst))
+    r := f_row(r, "No breakout", f_pctStr(pNoBreak), color.new(color.gray, 70))
+    r := f_row(r, "Directional evidence", dirTag, dirC)
+    r := f_row(r, "Continuation", ambiguous ? "AMBIGUOUS" : f_scoreStr(calCont), na(calCont) ? color.new(color.gray,80) : (calCont >= i_contThr ? color.new(color.green,60) : color.new(color.yellow,70)))
+    r := f_row(r, "Failure risk", ambiguous ? "AMBIGUOUS" : f_scoreStr(calFail), f_riskColor(calFail))
     if not i_minimal
         r := f_row(r, "VWAP alignment", vwapTag, vwapC)
         r := f_row(r, "Volatility", volCond, volCondC)
         r := f_row(r, "Relative volume", volTag, volColor)
-        r := f_row(r, "Note", inNewsBlackout ? "NEWS BLACKOUT" : (not volOk ? "Volume unavailable" : "Heuristic model"), inNewsBlackout ? color.new(color.orange, 55) : color.new(color.black, 30))
+        r := f_row(r, "Chop", chopTag, chopC)
+        r := f_row(r, "Note", inNewsBlackout ? "NEWS BLACKOUT" : (not volOk ? "Volume unavailable" : "Heuristic model"), inNewsBlackout ? color.new(color.orange,55) : color.new(color.black,30))
 
 // =============================================================================
-// SECTION 12 : ALERTS  (transition-gated unless repeat enabled)
+// SECTION 13 : ALERTS  (transition-gated unless repeat enabled)
 // =============================================================================
 f_fireOnce(bool cond) =>
     var bool armed = true
@@ -718,31 +775,37 @@ f_fireOnce(bool cond) =>
     fire
 
 sym = syminfo.ticker
-msgState = " | state=" + stateStr + " | ORB " + str.tostring(orbLow, format.mintick) + "-" + str.tostring(orbHigh, format.mintick)
+msgTail = " | state=" + stateStr + " | H=" + i_horizon + " | ORB " + (orbValid ? str.tostring(orbLow, format.mintick) + "-" + str.tostring(orbHigh, format.mintick) : "n/a")
 
-aBreak = confBar and orbReady and pBreakAny >= i_breakThr
-aUp    = confBar and orbReady and pUpFirst >= i_upThr
-aDn    = confBar and orbReady and pDnFirst >= i_dnThr
-aClUp  = closeAboveHigh and firstBreakDir == 1 and barsSinceBreak == 0
-aClDn  = closeBelowLow  and firstBreakDir == -1 and barsSinceBreak == 0
-aFail  = brokeOut and backInside and not failedBreak[1]
-aRetest = retestHold and not retestDone[1]
-aContDet = brokeOut and not na(calCont) and calCont < i_contThr and not na(calCont[1]) and calCont[1] >= i_contThr
+aBreak  = confBar and orbValid and isOneMin and not na(pBreakAny) and pBreakAny >= i_breakThr
+aUp     = confBar and orbValid and isOneMin and not na(pUpFirst) and pUpFirst >= i_upThr
+aDn     = confBar and orbValid and isOneMin and not na(pDnFirst) and pDnFirst >= i_dnThr
+aClUp   = isOneMin and closeAboveHigh and firstBreakDir == 1 and barsSinceBreak == 0
+aClDn   = isOneMin and closeBelowLow  and firstBreakDir == -1 and barsSinceBreak == 0
+aFail   = isOneMin and brokeOut and postOutcome == -1 and postOutcome[1] != -1
+aRetest = isOneMin and retestHold and not retestDone[1]
+aContDet = isOneMin and brokeOut and not na(calCont) and not na(calCont[1]) and calCont < i_contThr and calCont[1] >= i_contThr
+aNoEdgeIn  = isOneMin and state == 6 and state[1] != 6
+aNoEdgeOut = isOneMin and state != 6 and state[1] == 6
 
-alertcondition(true, "Any (use specific below)", "ORB engine alert")
+alertcondition(true, "Any (configure specific)", "ORB engine alert")
 if f_fireOnce(aBreak)
-    alert(sym + " breakout likelihood " + str.tostring(pBreakAny, "#.0") + "%" + msgState, i_repeat ? alert.freq_all : alert.freq_once_per_bar)
+    alert(sym + " breakout potential " + str.tostring(pBreakAny, "#.0") + (calibrated?"%":" (score)") + msgTail, i_repeat ? alert.freq_all : alert.freq_once_per_bar)
 if f_fireOnce(aUp)
-    alert(sym + " UP-first " + str.tostring(pUpFirst, "#.0") + "%" + msgState, alert.freq_once_per_bar)
+    alert(sym + " upside-first " + str.tostring(pUpFirst, "#.0") + (calibrated?"%":" (score)") + msgTail, alert.freq_once_per_bar)
 if f_fireOnce(aDn)
-    alert(sym + " DOWN-first " + str.tostring(pDnFirst, "#.0") + "%" + msgState, alert.freq_once_per_bar)
+    alert(sym + " downside-first " + str.tostring(pDnFirst, "#.0") + (calibrated?"%":" (score)") + msgTail, alert.freq_once_per_bar)
 if aClUp
-    alert(sym + " CONFIRMED close ABOVE ORB high " + str.tostring(orbHigh, format.mintick) + msgState, alert.freq_once_per_bar)
+    alert(sym + " CONFIRMED close ABOVE ORB high " + str.tostring(orbHigh, format.mintick) + msgTail, alert.freq_once_per_bar)
 if aClDn
-    alert(sym + " CONFIRMED close BELOW ORB low " + str.tostring(orbLow, format.mintick) + msgState, alert.freq_once_per_bar)
+    alert(sym + " CONFIRMED close BELOW ORB low " + str.tostring(orbLow, format.mintick) + msgTail, alert.freq_once_per_bar)
 if aFail
-    alert(sym + " FAILED breakout - back inside ORB" + msgState, alert.freq_once_per_bar)
+    alert(sym + " FAILED breakout — back inside ORB" + msgTail, alert.freq_once_per_bar)
 if aRetest
-    alert(sym + " RETEST held in break direction" + msgState, alert.freq_once_per_bar)
+    alert(sym + " RETEST held in break direction" + msgTail, alert.freq_once_per_bar)
 if aContDet
-    alert(sym + " Continuation evidence DETERIORATING (" + str.tostring(calCont, "#.0") + ")" + msgState, alert.freq_once_per_bar)
+    alert(sym + " Continuation evidence DETERIORATING (" + str.tostring(calCont, "#.0") + ")" + msgTail, alert.freq_once_per_bar)
+if f_fireOnce(aNoEdgeIn)
+    alert(sym + " entered RANGE / NO EDGE" + msgTail, alert.freq_once_per_bar)
+if f_fireOnce(aNoEdgeOut)
+    alert(sym + " left RANGE / NO EDGE" + msgTail, alert.freq_once_per_bar)
