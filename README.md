@@ -8,11 +8,12 @@ trustworthy those numbers are**.
 
 - **File:** [`NQ_ORB_Breakout_Probability_Engine.pine`](./NQ_ORB_Breakout_Probability_Engine.pine)
 
-> **Read this first.** The engine is defined on **confirmed 1-minute bars** and must be
-> run on a **1-minute chart**. On any other timeframe the dashboard shows a
-> `USE 1-MIN CHART` warning and **suppresses forecasts**, because the outcome labels
-> would change meaning. This is deliberate. You can keep this on a dedicated 1-minute
-> chart/layout tab for analysis while you execute on whatever timeframe you trade.
+> **Read this first.** The engine is **timeframe-adaptive**: a "breakout" is a confirmed
+> close of **your chart's candle** beyond the ORB, and the horizon is converted to the
+> matching number of bars. It is **tuned for the 5-minute chart** and works on any
+> intraday timeframe up to 60m. Daily+ timeframes are flagged `INSUFFICIENT DATA` (a
+> 5-minute opening range is meaningless there). Because outcome labels are defined on
+> your candle, if you calibrate (Phase 5) do it **per timeframe**.
 >
 > The displayed probabilities are a **transparent heuristic and are NOT statistically
 > validated**. Until you perform the calibration in [Phase 5](#phase-5--historical-calibration--validation),
@@ -101,15 +102,18 @@ Continuation/failure also have supporting **uncalibrated evidence scores** for t
 
 ---
 
-## 3. Install & recommended NQ settings (1-minute)
+## 3. Install & recommended NQ settings (5-minute)
 
-1. Open a **1-minute** chart (e.g. `CME_MINI:NQ1!`).
+1. Open a **5-minute** chart (e.g. `CME_MINI:NQ1!`). The ORB is your first 5-min candle.
 2. Pine Editor → paste [`NQ_ORB_Breakout_Probability_Engine.pine`](./NQ_ORB_Breakout_Probability_Engine.pine) → **Save** → **Add to chart**.
+
+On a 5-min chart: 09:30–09:35 is the opening candle; a breakout = a confirmed 5-min close
+beyond it; a 15-min horizon = the next 3 candles. Works on other intraday timeframes too.
 
 | Input | Default |
 |---|---|
 | ORB window / timezone | `0930-0935` / `America/New_York` |
-| Forecast mode / horizon | Rolling / 15 min |
+| Forecast mode / horizon | Rolling / 15 min (= 3 bars on 5-min) |
 | ATR / logistic k | 14 / 3.0 |
 | Touch tol / test lookback | 0.15×width / 20 |
 | Rel-vol baseline | 20 sessions |

@@ -13,17 +13,18 @@
 // -----------------------------------------------------------------------------
 // FORECASTING CONTRACT (read this before trusting any number)
 // -----------------------------------------------------------------------------
-// * TIMEFRAME: the engine is defined on CONFIRMED 1-MINUTE bars. Outcome labels
-//   ("a confirmed 1-min candle closes beyond the boundary") are only reproducible
-//   on a 1-minute chart. Run this on a 1-MINUTE chart (a separate layout/tab is
-//   fine while you execute elsewhere). On any other timeframe the dashboard shows
-//   a WRONG-TIMEFRAME warning and suppresses forecasts, because the labels would
-//   change meaning. This is deliberate honesty, not a bug.
+// * TIMEFRAME-ADAPTIVE: the engine adapts to YOUR chart timeframe. A "breakout"
+//   is a confirmed close of your chart's candle beyond the ORB, and the horizon
+//   (minutes) is converted to the matching number of bars. Tuned for the 5-MIN
+//   chart; works on any intraday timeframe up to 60m. Daily+ timeframes are
+//   flagged INSUFFICIENT DATA (a 5-minute opening range has no meaning there).
+//   NOTE: outcome labels are defined on your candle, so if you calibrate the
+//   probability map (Phase 5), calibrate it PER TIMEFRAME.
 //
 // * THREE PRE-BREAKOUT OUTCOMES (mutually exclusive & exhaustive), over horizon H:
-//     UPSIDE FIRST   - a confirmed 1-min close ABOVE ORB high occurs before any
+//     UPSIDE FIRST   - a confirmed close ABOVE ORB high occurs before any
 //                      confirmed close BELOW ORB low, within H.
-//     DOWNSIDE FIRST - a confirmed 1-min close BELOW ORB low occurs first, within H.
+//     DOWNSIDE FIRST - a confirmed close BELOW ORB low occurs first, within H.
 //     NO BREAKOUT    - neither confirmed close occurs within H.
 //   => P(UP) + P(DOWN) + P(NONE) = 1. A wick beyond a boundary is NOT a break.
 //   If both boundaries are closed through on the SAME bar, the bar is AMBIGUOUS
@@ -52,7 +53,7 @@
 // calibrated. See the README for the full validation workflow.
 // =============================================================================
 
-indicator("NQ 5-Min ORB Breakout Probability Engine v2", shorttitle="ORB-PROB v2", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+indicator("NQ 5-Min ORB Breakout Probability Engine v2 (adaptive)", shorttitle="ORB-PROB v2", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
 
 // =============================================================================
 // SECTION 0 : INPUTS
@@ -64,7 +65,7 @@ i_rthSession = input.session("0930-1600", "Regular session (VWAP / vol baseline)
 
 grpForecast  = "Forecast"
 i_mode       = input.string("Rolling", "Forecast mode", options=["Rolling","Snapshot (at ORB completion)"], tooltip="Rolling re-estimates every confirmed 1-min bar. Snapshot freezes one estimate at 09:35.", group=grpForecast)
-i_horizon    = input.string("15 min", "Horizon", options=["5 min","15 min","30 min"], group=grpForecast)
+i_horizon    = input.string("15 min", "Horizon", options=["10 min","15 min","30 min"], tooltip="Forecast window after the ORB completes. Converted to the matching number of bars on your chart timeframe (e.g. 15 min = 3 bars on a 5-min chart).", group=grpForecast)
 
 grpThresh    = "Thresholds & Alerts"
 i_breakThr   = input.float(60.0, "Alert: breakout potential >= (%)", minval=1, maxval=99, group=grpThresh)
@@ -159,13 +160,17 @@ applyCal   = i_calEnable and not isCalMapIdentity
 // Calibration status is an explicit honesty flag chosen by the user.
 calibrated = applyCal and (i_calStatus != "Uncalibrated")
 
-// ---- Timeframe guard --------------------------------------------------------
-// The engine is 1-minute-native. On other timeframes forecasts are suppressed.
-isOneMin   = timeframe.in_seconds() == 60
-tfMin      = math.max(1.0, timeframe.in_seconds() / 60.0)
-
-horizonMin = i_horizon == "5 min" ? 5 : i_horizon == "15 min" ? 15 : 30
-horizonBars = math.max(1, int(math.round(horizonMin / tfMin)))   // == horizonMin on 1-min
+// ---- Timeframe-adaptive engine ----------------------------------------------
+// The engine adapts to the CHART timeframe. A "breakout" is a confirmed close of
+// YOUR chart's candle beyond the ORB; the horizon (minutes) is converted to the
+// matching number of bars. It runs on any intraday timeframe (tuned for 5-min).
+// It is NOT meant for daily+ timeframes, where a 5-minute opening range has no
+// meaning — those are flagged INSUFFICIENT DATA.
+tfMin        = math.max(1.0, timeframe.in_seconds() / 60.0)
+tfIntraday   = timeframe.isintraday and tfMin <= 60     // engine is valid here
+// Horizon must be at least one bar on the current timeframe to be meaningful.
+horizonMin   = i_horizon == "10 min" ? 10 : i_horizon == "15 min" ? 15 : i_horizon == "30 min" ? 30 : 15
+horizonBars  = math.max(1, int(math.round(horizonMin / tfMin)))
 postHorzBars = math.max(1, int(math.round(i_postHorz / tfMin)))
 rollingMode  = i_mode == "Rolling"
 
@@ -489,7 +494,7 @@ closeBelowLow  = orbValid and confBar and close < orbLow
 // close beyond a boundary that lands AFTER the horizon is, by definition, a
 // NO-BREAKOUT outcome for this forecast and must not be labeled directional.
 inBreakWindow = orbValid and not na(barsSinceORB) and barsSinceORB >= 1 and barsSinceORB <= horizonBars
-if inBreakWindow and isOneMin and not inNewsBlackout and firstBreakDir == 0
+if inBreakWindow and tfIntraday and not inNewsBlackout and firstBreakDir == 0
     // Ambiguous: a single confirmed candle closes beyond BOTH boundaries.
     if closeAboveHigh and closeBelowLow
         firstBreakDir := 2
@@ -584,7 +589,7 @@ calFail = (not na(failScore) and applyCal) ? f_calibrate(failScore) : failScore
 // =============================================================================
 f_stateName(int s) => s==1?"ORB FORMING":s==2?"PRE-BREAKOUT":s==3?"BREAKOUT CONFIRMED":s==4?"CONTINUATION DEVELOPING":s==5?"FAILED BREAKOUT":s==6?"RANGE / NO EDGE":s==7?"INSUFFICIENT DATA":"—"
 
-insufficient = (not isOneMin) or (orbReady and not orbValid) or (barstate.isfirst) or (bar_index < rthBarsPerDay)
+insufficient = (not tfIntraday) or (orbReady and not orbValid) or (barstate.isfirst) or (bar_index < rthBarsPerDay)
 
 rawState = 0
 if insufficient
@@ -632,22 +637,18 @@ stateStr = f_stateName(state)
 // =============================================================================
 // SECTION 10 : VISUALIZATION  (anchored line.new so levels never float)
 // =============================================================================
-var line lnHigh = na
-var line lnMid  = na
-var line lnLow  = na
-if i_showORB
-    if orbEnded and orbValid
-        lnHigh := line.new(orbEndBar, orbHigh, bar_index, orbHigh, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.teal, 0), width=2)
-        lnLow  := line.new(orbEndBar, orbLow,  bar_index, orbLow,  xloc=xloc.bar_index, extend=extend.none, color=color.new(color.maroon, 0), width=2)
-        lnMid  := i_showMid ? line.new(orbEndBar, orbMid, bar_index, orbMid, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.gray, 40), width=1, style=line.style_dotted) : na
-    if orbValid and inRTH and not na(lnHigh)
-        line.set_xy1(lnHigh, orbEndBar, orbHigh)
-        line.set_xy2(lnHigh, bar_index, orbHigh)
-        line.set_xy1(lnLow,  orbEndBar, orbLow)
-        line.set_xy2(lnLow,  bar_index, orbLow)
-        if not na(lnMid)
-            line.set_xy1(lnMid, orbEndBar, orbMid)
-            line.set_xy2(lnMid, bar_index, orbMid)
+// ORB levels are drawn as NATIVE PLOT SERIES that hold the ORB high/low value
+// from the moment the range completes through the end of the RTH session, and
+// are `na` otherwise. Native plots are part of the chart's own coordinate grid,
+// so they are physically glued to price/time and cannot "float" or drift on
+// pan/zoom (unlike free-floating line objects). style_linebr keeps each
+// session's level as its own clean, gap-separated horizontal segment.
+orbHighPlot = (i_showORB and orbValid and inRTH) ? orbHigh : na
+orbLowPlot  = (i_showORB and orbValid and inRTH) ? orbLow  : na
+orbMidPlot  = (i_showORB and i_showMid and orbValid and inRTH) ? orbMid : na
+plot(orbHighPlot, "ORB High", color=color.new(color.teal, 0),   linewidth=2, style=plot.style_linebr)
+plot(orbLowPlot,  "ORB Low",  color=color.new(color.maroon, 0), linewidth=2, style=plot.style_linebr)
+plot(orbMidPlot,  "ORB Mid",  color=color.new(color.gray, 40),  linewidth=1, style=plot.style_linebr)
 
 plot(i_showVWAP and inRTH ? vwapVal : na, "VWAP", color=color.new(color.blue, 0), linewidth=1, style=plot.style_linebr)
 plot(i_showLvls and i_usePM ? pmH : na, "PM High", color=color.new(color.orange, 50), style=plot.style_circles)
@@ -678,7 +679,7 @@ plotshape(retestNow and firstBreakDir == -1, "Retest (down)", style=shape.circle
 // (We use 5 for an explicitly-resolved NO-BREAKOUT so it is distinguishable from
 // the still-open sentinel 0.) Resolution latches once and never un-resolves.
 var int preOutcome = 0
-if orbValid and preOutcome == 0 and isOneMin
+if orbValid and preOutcome == 0 and tfIntraday
     if ambiguous
         preOutcome := 8
     else if firstBreakDir == 1
@@ -738,8 +739,10 @@ if i_showDash and not na(dash) and barstate.islast
     table.cell(dash, 0, 0, "ORB BREAKOUT FORECAST", text_size=size.small, text_color=color.white, bgcolor=color.new(color.blue, 30))
     table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period + " · " + i_horizon, text_size=size.small, text_color=color.white, text_halign=text.align_right, bgcolor=color.new(color.blue, 30))
     int r = 1
-    if not isOneMin
-        r := f_row(r, "⚠ TIMEFRAME", "USE 1-MIN CHART", color.new(color.red, 40))
+    if not tfIntraday
+        r := f_row(r, "⚠ TIMEFRAME", "USE INTRADAY ≤60m", color.new(color.red, 40))
+    else if horizonBars < 2
+        r := f_row(r, "⚠ HORIZON", "H < 2 bars on this TF", color.new(color.orange, 45))
     r := f_row(r, "State", stateStr, stateC)
     r := f_row(r, "Mode", rollingMode ? "Rolling" : "Snapshot @09:35", color.new(color.black, 20))
     r := f_row(r, "Calibration", calTag, calColor)
@@ -777,16 +780,16 @@ f_fireOnce(bool cond) =>
 sym = syminfo.ticker
 msgTail = " | state=" + stateStr + " | H=" + i_horizon + " | ORB " + (orbValid ? str.tostring(orbLow, format.mintick) + "-" + str.tostring(orbHigh, format.mintick) : "n/a")
 
-aBreak  = confBar and orbValid and isOneMin and not na(pBreakAny) and pBreakAny >= i_breakThr
-aUp     = confBar and orbValid and isOneMin and not na(pUpFirst) and pUpFirst >= i_upThr
-aDn     = confBar and orbValid and isOneMin and not na(pDnFirst) and pDnFirst >= i_dnThr
-aClUp   = isOneMin and closeAboveHigh and firstBreakDir == 1 and barsSinceBreak == 0
-aClDn   = isOneMin and closeBelowLow  and firstBreakDir == -1 and barsSinceBreak == 0
-aFail   = isOneMin and brokeOut and postOutcome == -1 and postOutcome[1] != -1
-aRetest = isOneMin and retestHold and not retestDone[1]
-aContDet = isOneMin and brokeOut and not na(calCont) and not na(calCont[1]) and calCont < i_contThr and calCont[1] >= i_contThr
-aNoEdgeIn  = isOneMin and state == 6 and state[1] != 6
-aNoEdgeOut = isOneMin and state != 6 and state[1] == 6
+aBreak  = confBar and orbValid and tfIntraday and not na(pBreakAny) and pBreakAny >= i_breakThr
+aUp     = confBar and orbValid and tfIntraday and not na(pUpFirst) and pUpFirst >= i_upThr
+aDn     = confBar and orbValid and tfIntraday and not na(pDnFirst) and pDnFirst >= i_dnThr
+aClUp   = tfIntraday and closeAboveHigh and firstBreakDir == 1 and barsSinceBreak == 0
+aClDn   = tfIntraday and closeBelowLow  and firstBreakDir == -1 and barsSinceBreak == 0
+aFail   = tfIntraday and brokeOut and postOutcome == -1 and postOutcome[1] != -1
+aRetest = tfIntraday and retestHold and not retestDone[1]
+aContDet = tfIntraday and brokeOut and not na(calCont) and not na(calCont[1]) and calCont < i_contThr and calCont[1] >= i_contThr
+aNoEdgeIn  = tfIntraday and state == 6 and state[1] != 6
+aNoEdgeOut = tfIntraday and state != 6 and state[1] == 6
 
 alertcondition(true, "Any (configure specific)", "ORB engine alert")
 if f_fireOnce(aBreak)
