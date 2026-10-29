@@ -319,9 +319,12 @@ distToLow  = orbReady ? f_safeDiv(close - orbLow,  normW, na) : na   // >0 above
 // Boundary tests over lookback: a "test" = bar high/low within tol of boundary.
 touchHigh = orbReady and (high >= orbHigh - tol) and (high <= orbHigh + tol) and close < orbHigh
 touchLow  = orbReady and (low  <= orbLow  + tol) and (low  >= orbLow  - tol) and close > orbLow
-// Rolling count within lookback window (math.sum returns float -> keep as float).
-testsHigh = orbReady ? math.sum(touchHigh ? 1.0 : 0.0, i_testLook) : 0.0
-testsLow  = orbReady ? math.sum(touchLow  ? 1.0 : 0.0, i_testLook) : 0.0
+// Rolling count within lookback window. math.sum is called every bar (outside
+// any ternary) for consistent series state, then gated on orbReady afterwards.
+testsHighRaw = math.sum(touchHigh ? 1.0 : 0.0, i_testLook)
+testsLowRaw  = math.sum(touchLow  ? 1.0 : 0.0, i_testLook)
+testsHigh = orbReady ? testsHighRaw : 0.0
+testsLow  = orbReady ? testsLowRaw  : 0.0
 
 // Rejection strength after a test = how far price pulled back from the boundary.
 rejHigh = touchHigh ? f_safeDiv(orbHigh - close, normW, 0.0) : 0.0
@@ -493,7 +496,9 @@ displace = brokeOut ? (firstBreakDir == 1 ? f_safeDiv(close - orbHigh, normW, 0.
 
 // Follow-through: count of candles continuing the break direction after break.
 contBar = brokeOut and barsSinceBreak > 0 and barsSinceBreak <= i_followN and (firstBreakDir == 1 ? close > close[1] : close < close[1])
-followCount = brokeOut ? math.sum(contBar ? 1.0 : 0.0, i_followN) : na
+// math.sum called every bar (outside the ternary) for consistent series state.
+followCountRaw = math.sum(contBar ? 1.0 : 0.0, i_followN)
+followCount = brokeOut ? followCountRaw : na
 
 // VWAP alignment with the break direction.
 vwapAlign = brokeOut ? (firstBreakDir == 1 ? (close > vwapVal and vwapSlope > 0) : (close < vwapVal and vwapSlope < 0)) : false
@@ -607,9 +612,18 @@ breakUpMark = i_showMarks and closeAboveHigh and firstBreakDir == 1 and barsSinc
 breakDnMark = i_showMarks and closeBelowLow  and firstBreakDir == -1 and barsSinceBreak == 0
 plotshape(breakUpMark, "Breakout Up",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
 plotshape(breakDnMark, "Breakout Down", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),   size=size.tiny)
-failMark = i_showMarks and brokeOut and backInside and not failedBreak[1]
-plotshape(failMark, "Failed Breakout", style=shape.xcross, location=firstBreakDir == 1 ? location.abovebar : location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
-plotshape(i_showRetest and retestHold and not retestDone[1], "Retest", style=shape.circle, location=firstBreakDir == 1 ? location.belowbar : location.abovebar, color=color.new(color.blue, 0), size=size.tiny)
+// Failed-breakout markers: location must be a const, so split by direction.
+failMark   = i_showMarks and brokeOut and backInside and not failedBreak[1]
+failMarkUp = failMark and firstBreakDir == 1
+failMarkDn = failMark and firstBreakDir == -1
+plotshape(failMarkUp, "Failed Breakout (up)",   style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(failMarkDn, "Failed Breakout (down)", style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
+// Retest markers: likewise split by direction.
+retestMark   = i_showRetest and retestHold and not retestDone[1]
+retestMarkUp = retestMark and firstBreakDir == 1
+retestMarkDn = retestMark and firstBreakDir == -1
+plotshape(retestMarkUp, "Retest (up)",   style=shape.circle, location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny)
+plotshape(retestMarkDn, "Retest (down)", style=shape.circle, location=location.abovebar, color=color.new(color.blue, 0), size=size.tiny)
 
 // =============================================================================
 // SECTION 11 : DASHBOARD
